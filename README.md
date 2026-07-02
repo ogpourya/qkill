@@ -1,30 +1,30 @@
-# end
+# qkill
 
-Quickly end processes. Cross-platform. Interactive fuzzy search.
+Quickly kill processes. Cross-platform. Interactive fuzzy search.
 
 ## Install
 
 ```bash
-go install github.com/ogpourya/end@latest
+go install github.com/ogpourya/qkill@latest
 ```
 
 ## Usage
 
 ```bash
 # interactive TUI
-end
+qkill
 
 # kill by pid
-end 1337
+qkill 1337
 
 # kill by name
-end chrome
+qkill chrome
 
 # kill by port
-end :8080
+qkill :8080
 
 # force kill (SIGKILL)
-end -f 1337 chrome :3000
+qkill -f 1337 chrome :3000
 ```
 
 ## Keys

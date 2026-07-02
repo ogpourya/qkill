@@ -1,4 +1,4 @@
-module github.com/ogpourya/end
+module github.com/ogpourya/qkill
 
 go 1.26.4
 

@@ -283,7 +283,7 @@ func runCLI() {
 		}
 	}
 	if len(targets) == 0 {
-		fmt.Fprintln(os.Stderr, "Usage: end [-f] <pid|name|:port>...")
+		fmt.Fprintln(os.Stderr, "Usage: qkill [-f] <pid|name|:port>...")
 		os.Exit(1)
 	}
 
