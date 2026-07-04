@@ -20,19 +20,16 @@ import (
 var (
 	subtle = lipgloss.NewStyle().Foreground(lipgloss.Color("#626262"))
 	prompt = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF5F87"))
-	arrow  = lipgloss.NewStyle().Foreground(lipgloss.Color("#5FD7FF"))
-	hl     = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFD700"))
-	pidC   = lipgloss.NewStyle().Foreground(lipgloss.Color("#757575"))
-	nameC  = lipgloss.NewStyle().Foreground(lipgloss.Color("#D0D0D0"))
-	bar    = lipgloss.NewStyle().Padding(0, 1).Background(lipgloss.Color("#3A3A3A"))
 	footer = lipgloss.NewStyle().Foreground(lipgloss.Color("#5F5F5F"))
 )
 
 const refreshInterval = 1500 * time.Millisecond
 
 type proc struct {
-	pid  int32
-	name string
+	pid     int32
+	name    string
+	mem     uint64
+	cmdline string
 }
 
 type model struct {
@@ -40,14 +37,25 @@ type model struct {
 	query    textinput.Model
 	cursor   int
 	height   int
+	width    int
 	quitting bool
+	killPID  int32
+	askForce bool
+	killing  bool
 }
 
 type tickMsg time.Time
+type forceKillTickMsg time.Time
 
 func tickCmd() tea.Cmd {
 	return tea.Tick(refreshInterval, func(t time.Time) tea.Msg {
 		return tickMsg(t)
+	})
+}
+
+func forceKillCmd() tea.Cmd {
+	return tea.Tick(3*time.Second, func(t time.Time) tea.Msg {
+		return forceKillTickMsg(t)
 	})
 }
 
@@ -64,25 +72,93 @@ func fetchProcs() tea.Msg {
 		if err != nil {
 			continue
 		}
-		out = append(out, proc{pid: p.Pid, name: name})
+		var mem uint64
+		if mi, err := p.MemoryInfo(); err == nil {
+			mem = mi.RSS
+		}
+		cmdline, _ := p.Cmdline()
+		out = append(out, proc{pid: p.Pid, name: name, mem: mem, cmdline: cmdline})
 	}
 	sort.Slice(out, func(i, j int) bool {
-		return strings.ToLower(out[i].name) < strings.ToLower(out[j].name)
+		return out[i].mem > out[j].mem
 	})
 	return procsMsg(out)
 }
 
-func fuzzyMatch(s, q string) bool {
-	if q == "" {
-		return true
-	}
-	qi := 0
-	for i := 0; i < len(s) && qi < len(q); i++ {
-		if s[i] == q[qi] {
-			qi++
+func isAlpha(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+}
+
+func isAlnum(c byte) bool {
+	return isAlpha(c) || (c >= '0' && c <= '9')
+}
+
+func shellHighlight(s string) string {
+	var b strings.Builder
+	i := 0
+	for i < len(s) {
+		switch {
+		case s[i] == '#':
+			b.WriteString("\033[38;2;95;95;95m" + s[i:] + "\033[0m")
+			return b.String()
+
+		case s[i] == '\'':
+			j := i + 1
+			for j < len(s) && s[j] != '\'' {
+				j++
+			}
+			if j >= len(s) {
+				j = len(s) - 1
+			}
+			b.WriteString("\033[38;2;215;175;0m" + s[i:j+1] + "\033[0m")
+			i = j + 1
+
+		case s[i] == '"':
+			j := i + 1
+			for j < len(s) && s[j] != '"' {
+				if s[j] == '\\' {
+					j++
+				}
+				j++
+			}
+			if j >= len(s) {
+				j = len(s) - 1
+			}
+			b.WriteString("\033[38;2;95;215;95m" + s[i:j+1] + "\033[0m")
+			i = j + 1
+
+		case s[i] == '$' && i+1 < len(s) && (isAlpha(s[i+1]) || s[i+1] == '{'):
+			j := i + 1
+			if s[j] == '{' {
+				j++
+				for j < len(s) && s[j] != '}' {
+					j++
+				}
+				if j < len(s) {
+					j++
+				}
+			} else {
+				for j < len(s) && (isAlnum(s[j]) || s[j] == '_') {
+					j++
+				}
+			}
+			b.WriteString("\033[38;2;95;215;255m" + s[i:j] + "\033[0m")
+			i = j
+
+		case s[i] == '|' || s[i] == '&' || s[i] == ';':
+			b.WriteString("\033[38;2;255;175;95m" + string(s[i]) + "\033[0m")
+			i++
+
+		case s[i] == '>' || s[i] == '<':
+			b.WriteString("\033[38;2;255;175;95m" + string(s[i]) + "\033[0m")
+			i++
+
+		default:
+			b.WriteByte(s[i])
+			i++
 		}
 	}
-	return qi == len(q)
+	return b.String()
 }
 
 func (m *model) filtered() []proc {
@@ -92,40 +168,13 @@ func (m *model) filtered() []proc {
 	}
 	out := make([]proc, 0, len(m.procs)/4)
 	for _, p := range m.procs {
-		if fuzzyMatch(strings.ToLower(p.name), q) || strings.Contains(fmt.Sprint(p.pid), m.query.Value()) {
+		if strings.Contains(strings.ToLower(p.name), q) ||
+			strings.Contains(fmt.Sprint(p.pid), m.query.Value()) ||
+			strings.Contains(strings.ToLower(p.cmdline), q) {
 			out = append(out, p)
 		}
 	}
 	return out
-}
-
-func buildName(name, q string) string {
-	if q == "" {
-		return nameC.Render(name)
-	}
-	lower := strings.ToLower(name)
-	ql := strings.ToLower(q)
-	var b strings.Builder
-	qi := 0
-	inHL := false
-	for i := 0; i < len(name); i++ {
-		match := qi < len(ql) && lower[i] == ql[qi]
-		if match && !inHL {
-			b.WriteString("\033[0m\033[38;2;255;215;0m")
-			inHL = true
-		} else if !match && inHL {
-			b.WriteString("\033[0m\033[38;2;208;208;208m")
-			inHL = false
-		}
-		if match {
-			qi++
-		}
-		b.WriteByte(name[i])
-	}
-	if inHL {
-		b.WriteString("\033[0m")
-	}
-	return b.String()
 }
 
 func (m model) Init() tea.Cmd {
@@ -144,14 +193,40 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case forceKillTickMsg:
+		exists, err := process.PidExists(m.killPID)
+		if err == nil && exists {
+			m.askForce = true
+			return m, nil
+		}
+		m.quitting = true
+		return m, tea.Quit
+
 	case tea.WindowSizeMsg:
 		m.height = msg.Height
+		m.width = msg.Width
 		return m, nil
 
 	case tea.KeyMsg:
 		if m.quitting {
 			return m, tea.Quit
 		}
+
+		if m.killing {
+			if m.askForce {
+				switch msg.String() {
+				case "y", "Y", "enter":
+					syscall.Kill(int(m.killPID), syscall.SIGKILL)
+					m.quitting = true
+					return m, tea.Quit
+				case "n", "N", "esc":
+					m.quitting = true
+					return m, tea.Quit
+				}
+			}
+			return m, nil
+		}
+
 		switch msg.String() {
 		case "ctrl+c":
 			m.quitting = true
@@ -169,10 +244,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "enter":
 			list := m.filtered()
 			if m.cursor >= 0 && m.cursor < len(list) {
-				syscall.Kill(int(list[m.cursor].pid), syscall.SIGTERM)
+				p := list[m.cursor]
+				syscall.Kill(int(p.pid), syscall.SIGTERM)
+				m.killPID = p.pid
+				m.killing = true
+				return m, tea.Batch(textinput.Blink, forceKillCmd())
 			}
-			m.quitting = true
-			return m, tea.Quit
+			return m, nil
 
 		case "up":
 			if m.cursor > 0 {
@@ -201,52 +279,130 @@ func (m model) View() string {
 
 	var b strings.Builder
 
+	if m.killing {
+		if m.askForce {
+			b.WriteString(prompt.Render("  ⚡"))
+			b.WriteString(subtle.Render(fmt.Sprintf(" process %d still running — force kill? (y/n) ", m.killPID)))
+		} else {
+			b.WriteString(prompt.Render("  ⚡"))
+			b.WriteString(subtle.Render(fmt.Sprintf(" sent SIGTERM to %d, waiting 3s... ", m.killPID)))
+		}
+		b.WriteString("\n")
+		return b.String()
+	}
+
 	b.WriteString(prompt.Render("  ⚡"))
 	b.WriteString(subtle.Render(" kill pattern "))
 	b.WriteString(m.query.View())
 	b.WriteString("\n\n")
 
 	list := m.filtered()
-	if m.cursor >= len(list) {
+	if len(list) > 0 && m.cursor >= len(list) {
 		m.cursor = 0
 	}
 	if m.cursor < 0 {
 		m.cursor = 0
 	}
 
-	maxShow := m.height - 2
-	if maxShow < 5 {
-		maxShow = 5
+	boxW := m.width
+	if boxW < 40 {
+		boxW = 40
 	}
-	if maxShow > 15 {
-		maxShow = 15
+	contentW := boxW - 4
+	if contentW < 20 {
+		contentW = 20
 	}
 
-	start := m.cursor - maxShow/2
-	if start < 0 {
-		start = 0
+	availH := m.height - 3
+	if availH < 3 {
+		availH = 3
 	}
-	end := start + maxShow
-	if end > len(list) {
-		end = len(list)
-		start = end - maxShow
-		if start < 0 {
-			start = 0
+
+	start := 0
+	end := len(list)
+	if end > 0 {
+		// walk up from cursor counting box heights
+		up := m.cursor
+		usedUp := 0
+		for up >= 0 {
+			boxH := (len(list[up].cmdline)+contentW-1)/contentW + 3
+			if usedUp+boxH > availH/2 && up < m.cursor {
+				up++
+				break
+			}
+			usedUp += boxH
+			up--
 		}
+		if up < 0 {
+			up = 0
+		}
+		start = up
+
+		// walk down from cursor
+		down := m.cursor
+		usedDown := 0
+		for down < len(list) {
+			boxH := (len(list[down].cmdline)+contentW-1)/contentW + 3
+			if usedDown+boxH > availH/2 && down > m.cursor {
+				break
+			}
+			usedDown += boxH
+			down++
+		}
+		end = down
 	}
 
 	for i := start; i < end; i++ {
 		p := list[i]
-		pidStr := pidC.Render(fmt.Sprintf("%6d", p.pid))
 
-		var line string
+		curs := " "
 		if i == m.cursor {
-			line = arrow.Render("❯") + " " + pidStr + " " + nameC.Render(p.name)
-			line = bar.Render(line)
-		} else {
-			line = "  " + pidStr + " " + buildName(p.name, m.query.Value())
+			curs = "❯"
 		}
-		b.WriteString(line)
+
+		header := fmt.Sprintf("%s %d  %s  %s", curs, p.pid, fmtMem(p.mem), p.name)
+		if w := lipgloss.Width(header); w < contentW {
+			header += strings.Repeat(" ", contentW-w)
+		}
+
+		var content strings.Builder
+		content.WriteString(header)
+
+		if p.cmdline != "" {
+			cl := p.cmdline
+		outer:
+			for {
+				switch {
+				case len(cl) > contentW:
+					content.WriteString("\n")
+					line := shellHighlight(cl[:contentW])
+					if w := lipgloss.Width(line); w < contentW {
+						line += strings.Repeat(" ", contentW-w)
+					}
+					content.WriteString(line)
+					cl = cl[contentW:]
+				default:
+					content.WriteString("\n")
+					line := shellHighlight(cl)
+					if w := lipgloss.Width(line); w < contentW {
+						line += strings.Repeat(" ", contentW-w)
+					}
+					content.WriteString(line)
+					break outer
+				}
+			}
+		}
+
+		borderColor := "#3A3A3A"
+		if i == m.cursor {
+			borderColor = "#5FD7FF"
+		}
+		style := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color(borderColor)).
+			Padding(0, 1)
+
+		b.WriteString(style.Render(content.String()))
 		b.WriteString("\n")
 	}
 
@@ -260,6 +416,19 @@ func (m model) View() string {
 	}
 
 	return b.String()
+}
+
+func fmtMem(b uint64) string {
+	switch {
+	case b >= 1024*1024*1024:
+		return fmt.Sprintf("%.1fG", float64(b)/(1024*1024*1024))
+	case b >= 1024*1024:
+		return fmt.Sprintf("%.1fM", float64(b)/(1024*1024))
+	case b >= 1024:
+		return fmt.Sprintf("%.1fK", float64(b)/1024)
+	default:
+		return fmt.Sprintf("%dB", b)
+	}
 }
 
 func plural(n int) string {
