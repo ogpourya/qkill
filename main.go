@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -79,8 +81,11 @@ func fetchProcs() tea.Msg {
 		cmdline, _ := p.Cmdline()
 		out = append(out, proc{pid: p.Pid, name: name, mem: mem, cmdline: cmdline})
 	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].mem > out[j].mem
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].mem != out[j].mem {
+			return out[i].mem > out[j].mem
+		}
+		return strings.ToLower(out[i].name) < strings.ToLower(out[j].name)
 	})
 	return procsMsg(out)
 }
@@ -127,23 +132,34 @@ func shellHighlight(s string) string {
 			b.WriteString("\033[38;2;95;215;95m" + s[i:j+1] + "\033[0m")
 			i = j + 1
 
-		case s[i] == '$' && i+1 < len(s) && (isAlpha(s[i+1]) || s[i+1] == '{'):
-			j := i + 1
-			if s[j] == '{' {
-				j++
+		case s[i] == '$' && i+1 < len(s):
+			next := s[i+1]
+			if next == '?' || next == '!' || next == '@' || next == '*' ||
+				next == '$' || next == '-' || next == '#' ||
+				(next >= '0' && next <= '9') {
+				b.WriteString("\033[38;2;95;215;255m" + s[i:i+2] + "\033[0m")
+				i += 2
+			} else if next == '{' {
+				j := i + 2
 				for j < len(s) && s[j] != '}' {
 					j++
 				}
 				if j < len(s) {
 					j++
 				}
-			} else {
+				b.WriteString("\033[38;2;95;215;255m" + s[i:j] + "\033[0m")
+				i = j
+			} else if isAlpha(next) {
+				j := i + 2
 				for j < len(s) && (isAlnum(s[j]) || s[j] == '_') {
 					j++
 				}
+				b.WriteString("\033[38;2;95;215;255m" + s[i:j] + "\033[0m")
+				i = j
+			} else {
+				b.WriteByte(s[i])
+				i++
 			}
-			b.WriteString("\033[38;2;95;215;255m" + s[i:j] + "\033[0m")
-			i = j
 
 		case s[i] == '|' || s[i] == '&' || s[i] == ';':
 			b.WriteString("\033[38;2;255;175;95m" + string(s[i]) + "\033[0m")
@@ -175,6 +191,20 @@ func (m *model) filtered() []proc {
 		}
 	}
 	return out
+}
+
+func sliceChunk(s string, limit int) (head, tail string) {
+	if len(s) <= limit {
+		return s, ""
+	}
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	if cut == 0 {
+		return s[:limit], s[limit:]
+	}
+	return s[:cut], s[cut:]
 }
 
 func (m model) Init() tea.Cmd {
@@ -224,6 +254,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, tea.Quit
 				}
 			}
+			if msg.String() == "ctrl+c" || msg.String() == "esc" {
+				m.quitting = true
+				return m, tea.Quit
+			}
 			return m, nil
 		}
 
@@ -245,8 +279,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			list := m.filtered()
 			if m.cursor >= 0 && m.cursor < len(list) {
 				p := list[m.cursor]
-				syscall.Kill(int(p.pid), syscall.SIGTERM)
+				err := syscall.Kill(int(p.pid), syscall.SIGTERM)
 				m.killPID = p.pid
+				if errors.Is(err, syscall.ESRCH) {
+					m.quitting = true
+					return m, tea.Quit
+				}
 				m.killing = true
 				return m, tea.Batch(textinput.Blink, forceKillCmd())
 			}
@@ -338,8 +376,8 @@ func (m model) View() string {
 		}
 		start = up
 
-		// walk down from cursor
-		down := m.cursor
+		// walk down from below cursor
+		down := m.cursor + 1
 		usedDown := 0
 		for down < len(list) {
 			boxH := (len(list[down].cmdline)+contentW-1)/contentW + 3
@@ -370,26 +408,18 @@ func (m model) View() string {
 
 		if p.cmdline != "" {
 			cl := p.cmdline
-		outer:
 			for {
-				switch {
-				case len(cl) > contentW:
-					content.WriteString("\n")
-					line := shellHighlight(cl[:contentW])
-					if w := lipgloss.Width(line); w < contentW {
-						line += strings.Repeat(" ", contentW-w)
-					}
-					content.WriteString(line)
-					cl = cl[contentW:]
-				default:
-					content.WriteString("\n")
-					line := shellHighlight(cl)
-					if w := lipgloss.Width(line); w < contentW {
-						line += strings.Repeat(" ", contentW-w)
-					}
-					content.WriteString(line)
-					break outer
+				chunk, rest := sliceChunk(cl, contentW)
+				content.WriteString("\n")
+				line := shellHighlight(chunk)
+				if w := lipgloss.Width(line); w < contentW {
+					line += strings.Repeat(" ", contentW-w)
 				}
+				content.WriteString(line)
+				if rest == "" {
+					break
+				}
+				cl = rest
 			}
 		}
 
