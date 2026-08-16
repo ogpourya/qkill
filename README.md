@@ -29,7 +29,7 @@ qkill -f 1337 chrome :3000
 
 ## Interactive TUI
 
-Processes are displayed in bordered boxes sorted by RAM usage (descending). Each box shows PID, memory, process name, and the command line with shell syntax highlighting.
+Processes are displayed in bordered boxes sorted by RAM usage (descending). Each box shows PID, memory, process name, and the command line.
 
 Long command lines are wrapped to fit the terminal width.
 

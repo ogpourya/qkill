@@ -90,92 +90,7 @@ func fetchProcs() tea.Msg {
 	return procsMsg(out)
 }
 
-func isAlpha(c byte) bool {
-	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
-}
 
-func isAlnum(c byte) bool {
-	return isAlpha(c) || (c >= '0' && c <= '9')
-}
-
-func shellHighlight(s string) string {
-	var b strings.Builder
-	i := 0
-	for i < len(s) {
-		switch {
-		case s[i] == '#':
-			b.WriteString("\033[38;2;95;95;95m" + s[i:] + "\033[0m")
-			return b.String()
-
-		case s[i] == '\'':
-			j := i + 1
-			for j < len(s) && s[j] != '\'' {
-				j++
-			}
-			if j >= len(s) {
-				j = len(s) - 1
-			}
-			b.WriteString("\033[38;2;215;175;0m" + s[i:j+1] + "\033[0m")
-			i = j + 1
-
-		case s[i] == '"':
-			j := i + 1
-			for j < len(s) && s[j] != '"' {
-				if s[j] == '\\' {
-					j++
-				}
-				j++
-			}
-			if j >= len(s) {
-				j = len(s) - 1
-			}
-			b.WriteString("\033[38;2;95;215;95m" + s[i:j+1] + "\033[0m")
-			i = j + 1
-
-		case s[i] == '$' && i+1 < len(s):
-			next := s[i+1]
-			if next == '?' || next == '!' || next == '@' || next == '*' ||
-				next == '$' || next == '-' || next == '#' ||
-				(next >= '0' && next <= '9') {
-				b.WriteString("\033[38;2;95;215;255m" + s[i:i+2] + "\033[0m")
-				i += 2
-			} else if next == '{' {
-				j := i + 2
-				for j < len(s) && s[j] != '}' {
-					j++
-				}
-				if j < len(s) {
-					j++
-				}
-				b.WriteString("\033[38;2;95;215;255m" + s[i:j] + "\033[0m")
-				i = j
-			} else if isAlpha(next) {
-				j := i + 2
-				for j < len(s) && (isAlnum(s[j]) || s[j] == '_') {
-					j++
-				}
-				b.WriteString("\033[38;2;95;215;255m" + s[i:j] + "\033[0m")
-				i = j
-			} else {
-				b.WriteByte(s[i])
-				i++
-			}
-
-		case s[i] == '|' || s[i] == '&' || s[i] == ';':
-			b.WriteString("\033[38;2;255;175;95m" + string(s[i]) + "\033[0m")
-			i++
-
-		case s[i] == '>' || s[i] == '<':
-			b.WriteString("\033[38;2;255;175;95m" + string(s[i]) + "\033[0m")
-			i++
-
-		default:
-			b.WriteByte(s[i])
-			i++
-		}
-	}
-	return b.String()
-}
 
 func (m *model) filtered() []proc {
 	q := strings.ToLower(m.query.Value())
@@ -411,7 +326,7 @@ func (m model) View() string {
 			for {
 				chunk, rest := sliceChunk(cl, contentW)
 				content.WriteString("\n")
-				line := shellHighlight(chunk)
+				line := chunk
 				if w := lipgloss.Width(line); w < contentW {
 					line += strings.Repeat(" ", contentW-w)
 				}
