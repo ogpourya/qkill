@@ -39,7 +39,7 @@ Long command lines are wrapped to fit the terminal width.
 |-----|--------|
 | type | substring search (name, pid, cmdline) |
 | `↑` `↓` | navigate |
-| `enter` | kill (SIGTERM) — if process still alive after 3s, prompts for force kill |
+| `enter` | kill (SIGTERM) — if process still alive after 1.5s, prompts for force kill |
 | `ctrl+c` | quit |
 | `esc` | clear query / quit (when query empty) |
 
