@@ -47,7 +47,7 @@ Long command lines are wrapped to fit the terminal width.
 
 1. Press `enter` on a process → sends SIGTERM
 2. If the process is already dead → exits immediately
-3. Waits 3 seconds, then checks if the process still exists
+3. Waits 1.5 seconds, then checks if the process still exists
 4. If still alive → prompts `process X still running — force kill? (y/n)`
 5. `y` / `enter` → sends SIGKILL and exits
 6. `n` / `esc` → exits without killing

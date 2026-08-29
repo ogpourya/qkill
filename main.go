@@ -56,7 +56,7 @@ func tickCmd() tea.Cmd {
 }
 
 func forceKillCmd() tea.Cmd {
-	return tea.Tick(3*time.Second, func(t time.Time) tea.Msg {
+	return tea.Tick(1500*time.Millisecond, func(t time.Time) tea.Msg {
 		return forceKillTickMsg(t)
 	})
 }
@@ -238,7 +238,7 @@ func (m model) View() string {
 			b.WriteString(subtle.Render(fmt.Sprintf(" process %d still running — force kill? (y/n) ", m.killPID)))
 		} else {
 			b.WriteString(prompt.Render("  ⚡"))
-			b.WriteString(subtle.Render(fmt.Sprintf(" sent SIGTERM to %d, waiting 3s... ", m.killPID)))
+			b.WriteString(subtle.Render(fmt.Sprintf(" sent SIGTERM to %d, waiting 1.5s... ", m.killPID)))
 		}
 		b.WriteString("\n")
 		return b.String()
