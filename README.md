@@ -1,11 +1,11 @@
 # qkill
 
-Quickly kill processes. Cross-platform. Interactive substring search.
+Quickly kill processes. Interactive substring search.
 
 ## Install
 
 ```bash
-go install github.com/ogpourya/qkill@latest
+GOPROXY=direct go install github.com/ogpourya/qkill@latest
 ```
 
 ## Usage

@@ -1,0 +1,72 @@
+name: Release
+
+# Rolling `latest` release: rebuilt and overwritten on every push to the default
+# branch, so the release always matches HEAD. Linux binaries only.
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+  schedule:
+    # Safety net: a push that skipped CI self-heals the next day.
+    - cron: '23 5 * * *'
+
+permissions:
+  contents: write
+
+# The only per-repo knob, if a repo ever needs a different arch set.
+env:
+  ARCHES: amd64 arm64
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          NAME=$(go list -m | sed -E 's|/v[0-9]+$||' | awk -F/ '{print $NF}')
+          rm -rf dist && mkdir dist
+          for arch in $ARCHES; do
+            out="$NAME-linux-$arch"
+            mkdir "dist/$out"
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch \
+              go build -trimpath -ldflags='-s -w' -o "dist/$out/$NAME" .
+            chmod +x "dist/$out/$NAME"
+            tar czf "dist/$out.tar.gz" -C "dist/$out" .
+            rm -rf "dist/$out"
+          done
+          (cd dist && sha256sum ./*.tar.gz > SHA256SUMS)
+          ls -la dist
+
+      - name: Update rolling release
+        env:
+          GH_TOKEN: *** secrets.GITHUB_TOKEN }}
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          MOD=$(go list -m)
+          SHORT=${SHA::7}
+          NOTES="Linux build of \`$SHORT\` — replaced on every push to the default branch.
+
+          \`\`\`bash
+          GOPROXY=direct go install $MOD@latest
+          \`\`\`
+
+          Or grab a binary from the files below, then \`sha256sum -c SHA256SUMS\`.
+          "
+          # Move the rolling tag onto HEAD; create it on the first run.
+          gh api -X PATCH "repos/$REPO/git/refs/tags/latest" -f sha="$SHA" -F force=true >/dev/null 2>&1 \
+            || gh api -X POST "repos/$REPO/git/refs" -f ref=refs/tags/latest -f sha="$SHA" >/dev/null
+          gh release create latest --title "latest ($SHORT)" --notes "$NOTES" 2>/dev/null \
+            || gh release edit latest --title "latest ($SHORT)" --notes "$NOTES"
+          gh release upload latest dist/* --clobber
+          echo "published https://github.com/$REPO/releases/tag/latest"
