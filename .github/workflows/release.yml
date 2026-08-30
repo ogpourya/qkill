@@ -48,7 +48,7 @@ jobs:
 
       - name: Update rolling release
         env:
-          GH_TOKEN: *** secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SHA: ${{ github.sha }}
           REPO: ${{ github.repository }}
         run: |
