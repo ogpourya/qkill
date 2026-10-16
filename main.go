@@ -43,7 +43,12 @@ var (
 	selfPID = int32(os.Getpid())
 )
 
-const refreshInterval = 1500 * time.Millisecond
+const (
+	steadyInterval  = 1000 * time.Millisecond
+	warmupInterval  = 200 * time.Millisecond
+	killGracePeriod = 3 * time.Second
+	killPollInterval = 40 * time.Millisecond
+)
 
 type sortMode int
 
@@ -142,24 +147,51 @@ type model struct {
 	sortBy   sortMode
 	quitting bool
 	killPID  int32
+	killDeadline time.Time
 	askForce bool
 	killing  bool
 	errMsg   string
 }
 
 type tickMsg time.Time
-type forceKillTickMsg time.Time
+type killCheckMsg struct{}
 
-func tickCmd() tea.Cmd {
-	return tea.Tick(refreshInterval, func(t time.Time) tea.Msg {
+func nextTickCmd(firstRun bool) tea.Cmd {
+	delay := steadyInterval
+	if firstRun {
+		delay = warmupInterval
+	}
+	return tea.Tick(delay, func(t time.Time) tea.Msg {
 		return tickMsg(t)
 	})
 }
 
-func forceKillCmd() tea.Cmd {
-	return tea.Tick(1500*time.Millisecond, func(t time.Time) tea.Msg {
-		return forceKillTickMsg(t)
+func checkKillCmd() tea.Cmd {
+	return tea.Tick(killPollInterval, func(time.Time) tea.Msg {
+		return killCheckMsg{}
 	})
+}
+
+// isAliveAndNotZombie reports whether pid is still a live process.
+// A zombie (dead but unreaped) counts as dead so we quit instead of prompting.
+func isAliveAndNotZombie(pid int32) bool {
+	if errors.Is(syscall.Kill(int(pid), 0), syscall.ESRCH) {
+		return false
+	}
+	if p, err := process.NewProcess(pid); err == nil {
+		if statuses, err := p.Status(); err == nil {
+			for _, s := range statuses {
+				if s == process.Zombie {
+					return false
+				}
+			}
+		} else {
+			return false
+		}
+	} else {
+		return false
+	}
+	return true
 }
 
 type procsMsg []proc
@@ -252,7 +284,7 @@ func fetchProcs() tea.Msg {
 
 		dt := now.Sub(cp.lastSample).Seconds()
 		if dt <= 0 {
-			dt = refreshInterval.Seconds()
+			dt = steadyInterval.Seconds()
 		}
 
 		// 1. RAM
@@ -660,7 +692,8 @@ func countChunks(s string, limit int) int {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(textinput.Blink, fetchProcs, tickCmd())
+	// Fetch immediately; procsMsg schedules the warmup tick.
+	return tea.Batch(textinput.Blink, fetchProcs)
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -669,22 +702,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.killing || m.quitting {
 			return m, nil
 		}
-		return m, tea.Batch(fetchProcs, tickCmd())
+		return m, fetchProcs
 
 	case procsMsg:
+		firstRun := len(m.procs) == 0
 		m.procs = msg
 		sortProcs(m.procs, m.sortBy)
 		m.clampCursor()
-		return m, nil
+		if m.killing || m.quitting {
+			return m, nil
+		}
+		return m, nextTickCmd(firstRun)
 
-	case forceKillTickMsg:
-		exists, err := process.PidExists(m.killPID)
-		if err == nil && exists {
+	case killCheckMsg:
+		if !isAliveAndNotZombie(m.killPID) {
+			m.quitting = true
+			return m, tea.Quit
+		}
+		if time.Now().After(m.killDeadline) {
 			m.askForce = true
 			return m, nil
 		}
-		m.quitting = true
-		return m, tea.Quit
+		return m, checkKillCmd()
 
 	case tea.WindowSizeMsg:
 		m.height = msg.Height
@@ -757,7 +796,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.killPID = p.pid
 				m.killing = true
-				return m, tea.Batch(textinput.Blink, forceKillCmd())
+				m.killDeadline = time.Now().Add(killGracePeriod)
+				return m, tea.Batch(textinput.Blink, checkKillCmd())
 			}
 			return m, nil
 
@@ -826,7 +866,7 @@ func (m model) View() string {
 			b.WriteString(subtle.Render(fmt.Sprintf(" process %d still running — force kill? (y/n) ", m.killPID)))
 		} else {
 			b.WriteString(prompt.Render("  ⚡"))
-			b.WriteString(subtle.Render(fmt.Sprintf(" sent SIGTERM to %d, waiting 1.5s... ", m.killPID)))
+			b.WriteString(subtle.Render(fmt.Sprintf(" sent SIGTERM to %d, waiting... ", m.killPID)))
 		}
 		b.WriteString("\n")
 		return b.String()
@@ -1176,9 +1216,6 @@ func main() {
 	}
 
 	if len(targets) == 0 && !force {
-		// Prime initial counters (CPU, Disk, Network, AMD/Intel DRM ns)
-		_ = fetchProcs()
-
 		m := model{
 			query:  textinput.New(),
 			sortBy: initialSort,

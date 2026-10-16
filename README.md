@@ -35,7 +35,7 @@ qkill -f 1337 chrome :3000
 
 Processes are displayed in bordered boxes. Each header shows PID, RAM, CPU%, disk I/O rate, network rate, GPU usage, and process name, followed by the wrapped command line.
 
-A sort bar (`RAM CPU DISK NET GPU`) next to the search prompt shows the active metric. Refresh is every 1.5s; CPU/disk/net/GPU rates are per-second deltas between ticks. qkill never lists or kills itself.
+A sort bar (`RAM CPU DISK NET GPU`) next to the search prompt shows the active metric. Refresh is every 1s (200ms warmup on startup); CPU/disk/net/GPU rates are per-second deltas between ticks. qkill never lists or kills itself.
 
 Metric sources:
 
@@ -52,7 +52,7 @@ Metric sources:
 | type | substring search (name, pid, cmdline) |
 | `↑` `↓` | navigate |
 | `tab` / `shift+tab` | cycle sort: RAM → CPU → DISK → NET → GPU |
-| `enter` | kill (SIGTERM) — if process still alive after 1.5s, prompts for force kill |
+| `enter` | kill (SIGTERM) — exits as soon as process dies, prompts for force kill after 3s |
 | `ctrl+c` | quit |
 | `esc` | clear query / quit (when query empty) |
 
@@ -60,8 +60,8 @@ Metric sources:
 
 1. Press `enter` on a process → sends SIGTERM
 2. If the process is already dead → exits immediately
-3. Waits 1.5 seconds, then checks if the process still exists
-4. If still alive → prompts `process X still running — force kill? (y/n)`
+3. Polls every 40ms; exits as soon as the process is gone (zombies count as dead)
+4. If still alive after 3 seconds → prompts `process X still running — force kill? (y/n)`
 5. `y` / `enter` → sends SIGKILL and exits
 6. `n` / `esc` → exits without killing
 
