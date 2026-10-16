@@ -1,10 +1,13 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -21,9 +24,11 @@ import (
 )
 
 var (
-	subtle = lipgloss.NewStyle().Foreground(lipgloss.Color("#626262"))
-	prompt = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF5F87"))
-	footer = lipgloss.NewStyle().Foreground(lipgloss.Color("#5F5F5F"))
+	subtle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#626262"))
+	prompt     = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF5F87"))
+	footer     = lipgloss.NewStyle().Foreground(lipgloss.Color("#5F5F5F"))
+	activePill = lipgloss.NewStyle().Foreground(lipgloss.Color("#000000")).Background(lipgloss.Color("#5FD7FF")).Bold(true).Padding(0, 1)
+	idlePill   = lipgloss.NewStyle().Foreground(lipgloss.Color("#8A8A8A")).Background(lipgloss.Color("#262626")).Padding(0, 1)
 
 	boxStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
@@ -45,13 +50,25 @@ type sortMode int
 const (
 	sortByMem sortMode = iota
 	sortByCPU
+	sortByDisk
+	sortByNet
+	sortByGPU
+	sortModeCount
 )
 
 func (s sortMode) String() string {
-	if s == sortByCPU {
+	switch s {
+	case sortByCPU:
 		return "CPU"
+	case sortByDisk:
+		return "DISK"
+	case sortByNet:
+		return "NET"
+	case sortByGPU:
+		return "GPU"
+	default:
+		return "RAM"
 	}
-	return "RAM"
 }
 
 type proc struct {
@@ -59,14 +76,21 @@ type proc struct {
 	name         string
 	nameLower    string
 	pidStr       string
-	mem          uint64
-	cpu          float64
+	mem          uint64  // Resident memory (bytes)
+	cpu          float64 // CPU usage (%)
+	diskRate     uint64  // Disk read+write rate (bytes/sec)
+	netRate      uint64  // Network rx+tx rate (bytes/sec)
+	gpuMem       uint64  // GPU VRAM/GTT usage (bytes)
+	gpuPct       float64 // GPU engine usage (%)
 	cmdline      string
 	cmdlineLower string
 }
 
-// cachedProc preserves *process.Process across ticks so CPUPercent() computes
-// real-time interval deltas and static strings (name, cmdline) are read once.
+type gpuSample struct {
+	mem uint64
+	pct float64
+}
+
 type cachedProc struct {
 	handle       *process.Process
 	createTime   int64
@@ -75,14 +99,39 @@ type cachedProc struct {
 	pidStr       string
 	cmdline      string
 	cmdlineLower string
+	lastDisk     uint64
+	lastNet      uint64
+	lastGPUNs    uint64
+	hasNetSample bool
+	hasGPUSample bool
+	lastSample   time.Time
 }
 
 var (
-	procCacheMu sync.Mutex
-	procCache   = make(map[int32]*cachedProc)
+	procCacheMu      sync.Mutex
+	procCache        = make(map[int32]*cachedProc)
+	sanitizeReplacer = strings.NewReplacer("\n", " ", "\r", " ", "\t", " ")
+
+	toolCheckOnce sync.Once
+	hasNvidiaSMI  bool
+	hasSS         bool
+	hasNettop     bool
+
+	ssPidRe   = regexp.MustCompile(`pid=(\d+)`)
+	ssAckedRe = regexp.MustCompile(`bytes_acked:(\d+)`)
+	ssRecvRe  = regexp.MustCompile(`bytes_received:(\d+)`)
 )
 
-var sanitizeReplacer = strings.NewReplacer("\n", " ", "\r", " ", "\t", " ")
+func initTools() {
+	toolCheckOnce.Do(func() {
+		_, err := exec.LookPath("nvidia-smi")
+		hasNvidiaSMI = err == nil
+		_, err = exec.LookPath("ss")
+		hasSS = err == nil
+		_, err = exec.LookPath("nettop")
+		hasNettop = err == nil
+	})
+}
 
 type model struct {
 	procs    []proc
@@ -116,10 +165,30 @@ func forceKillCmd() tea.Cmd {
 type procsMsg []proc
 
 func fetchProcs() tea.Msg {
+	initTools()
+
 	pids, err := process.Pids()
 	if err != nil {
 		return procsMsg(nil)
 	}
+
+	var (
+		netTotals map[int32]uint64
+		nvTotals  map[int32]gpuSample
+		wg        sync.WaitGroup
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		netTotals = collectNetBytesByPID()
+	}()
+	go func() {
+		defer wg.Done()
+		nvTotals = collectNvidiaGPUByPID()
+	}()
+	wg.Wait()
+
+	now := time.Now()
 
 	procCacheMu.Lock()
 	defer procCacheMu.Unlock()
@@ -148,8 +217,15 @@ func fetchProcs() tea.Msg {
 			cmdline = sanitizeReplacer.Replace(cmdline)
 			ctime, _ := h.CreateTime()
 
-			// Prime baseline CPU times on first sight so the next tick measures delta
 			_, _ = h.CPUPercent()
+			var initDisk uint64
+			if ioStat, err := h.IOCounters(); err == nil && ioStat != nil {
+				initDisk = ioStat.ReadBytes + ioStat.WriteBytes
+			}
+			var initGPUNs uint64
+			if runtime.GOOS == "linux" {
+				_, initGPUNs = readLinuxDRMStats(pid)
+			}
 
 			cp = &cachedProc{
 				handle:       h,
@@ -159,21 +235,87 @@ func fetchProcs() tea.Msg {
 				pidStr:       strconv.Itoa(int(pid)),
 				cmdline:      cmdline,
 				cmdlineLower: strings.ToLower(cmdline),
+				lastDisk:     initDisk,
+				lastNet:      netTotals[pid],
+				lastGPUNs:    initGPUNs,
+				hasNetSample: netTotals[pid] > 0,
+				hasGPUSample: initGPUNs > 0,
+				lastSample:   now,
 			}
 			procCache[pid] = cp
 		} else {
-			// Guard against PID reuse
 			if ctime, err := cp.handle.CreateTime(); err != nil || (cp.createTime != 0 && ctime != cp.createTime) {
 				delete(procCache, pid)
 				continue
 			}
 		}
 
+		dt := now.Sub(cp.lastSample).Seconds()
+		if dt <= 0 {
+			dt = refreshInterval.Seconds()
+		}
+
+		// 1. RAM
 		var mem uint64
 		if mi, err := cp.handle.MemoryInfo(); err == nil && mi != nil {
 			mem = mi.RSS
 		}
+
+		// 2. CPU
 		cpuPct, _ := cp.handle.CPUPercent()
+
+		// 3. Disk I/O rate (bytes/sec)
+		var diskRate uint64
+		if ioStat, err := cp.handle.IOCounters(); err == nil && ioStat != nil {
+			currDisk := ioStat.ReadBytes + ioStat.WriteBytes
+			if currDisk >= cp.lastDisk && !cp.lastSample.Equal(now) {
+				diskRate = uint64(float64(currDisk-cp.lastDisk) / dt)
+			}
+			cp.lastDisk = currDisk
+		}
+
+		// 4. Network rate (bytes/sec)
+		var netRate uint64
+		if currNet, exists := netTotals[pid]; exists {
+			if cp.hasNetSample && currNet >= cp.lastNet && !cp.lastSample.Equal(now) {
+				netRate = uint64(float64(currNet-cp.lastNet) / dt)
+			}
+			cp.lastNet = currNet
+			cp.hasNetSample = true
+		}
+
+		// 5. GPU (Native Linux DRM for AMD/Intel + NVIDIA pmon fallback)
+		var gpuMem uint64
+		var gpuPct float64
+
+		if runtime.GOOS == "linux" {
+			drmMem, drmNs := readLinuxDRMStats(pid)
+			gpuMem = drmMem
+			if drmNs > 0 {
+				if cp.hasGPUSample && drmNs >= cp.lastGPUNs && !cp.lastSample.Equal(now) {
+					elapsedNs := float64(now.Sub(cp.lastSample).Nanoseconds())
+					if elapsedNs > 0 {
+						gpuPct = (float64(drmNs-cp.lastGPUNs) / elapsedNs) * 100.0
+						if gpuPct > 100.0 {
+							gpuPct = 100.0
+						}
+					}
+				}
+				cp.lastGPUNs = drmNs
+				cp.hasGPUSample = true
+			}
+		}
+
+		if nv, ok := nvTotals[pid]; ok {
+			if nv.mem > gpuMem {
+				gpuMem = nv.mem
+			}
+			if nv.pct > gpuPct {
+				gpuPct = nv.pct
+			}
+		}
+
+		cp.lastSample = now
 
 		out = append(out, proc{
 			pid:          pid,
@@ -182,12 +324,15 @@ func fetchProcs() tea.Msg {
 			pidStr:       cp.pidStr,
 			mem:          mem,
 			cpu:          cpuPct,
+			diskRate:     diskRate,
+			netRate:      netRate,
+			gpuMem:       gpuMem,
+			gpuPct:       gpuPct,
 			cmdline:      cp.cmdline,
 			cmdlineLower: cp.cmdlineLower,
 		})
 	}
 
-	// Evict dead PIDs from cache
 	for pid := range procCache {
 		if _, alive := active[pid]; !alive {
 			delete(procCache, pid)
@@ -197,24 +342,266 @@ func fetchProcs() tea.Msg {
 	return procsMsg(out)
 }
 
-func sortProcs(list []proc, mode sortMode) {
-	sort.SliceStable(list, func(i, j int) bool {
-		if mode == sortByCPU {
-			if list[i].cpu != list[j].cpu {
-				return list[i].cpu > list[j].cpu
-			}
-			if list[i].mem != list[j].mem {
-				return list[i].mem > list[j].mem
-			}
-		} else {
-			if list[i].mem != list[j].mem {
-				return list[i].mem > list[j].mem
-			}
-			if list[i].cpu != list[j].cpu {
-				return list[i].cpu > list[j].cpu
+// readLinuxDRMStats reads AMD (amdgpu) and Intel (i915/xe) GPU usage directly
+// from the Linux kernel DRM subsystem via /proc/<pid>/fd and /proc/<pid>/fdinfo.
+func readLinuxDRMStats(pid int32) (totalMem uint64, totalEngineNs uint64) {
+	pidStr := strconv.Itoa(int(pid))
+	fdDir := "/proc/" + pidStr + "/fd"
+	fdinfoDir := "/proc/" + pidStr + "/fdinfo"
+
+	fds, err := os.ReadDir(fdDir)
+	if err != nil {
+		return 0, 0
+	}
+
+	seenClients := make(map[string]struct{})
+
+	for _, fd := range fds {
+		name := fd.Name()
+		// Fast filter: only read fdinfo if the FD points to a GPU device (/dev/dri/*)
+		link, err := os.Readlink(fdDir + "/" + name)
+		if err != nil || !strings.HasPrefix(link, "/dev/dri/") {
+			continue
+		}
+
+		data, err := os.ReadFile(filepath.Join(fdinfoDir, name))
+		if err != nil {
+			continue
+		}
+
+		var (
+			clientID string
+			vram     uint64
+			gtt      uint64
+			otherMem uint64
+			engineNs uint64
+		)
+
+		for _, line := range strings.Split(string(data), "\n") {
+			switch {
+			case strings.HasPrefix(line, "drm-client-id:"):
+				clientID = strings.TrimSpace(strings.TrimPrefix(line, "drm-client-id:"))
+
+			case strings.HasPrefix(line, "drm-memory-vram:"):
+				vram = parseDRMBytes(line)
+
+			case strings.HasPrefix(line, "drm-memory-gtt:"):
+				gtt = parseDRMBytes(line)
+
+			case strings.HasPrefix(line, "drm-resident-memory:"), strings.HasPrefix(line, "drm-total-memory:"):
+				if v := parseDRMBytes(line); v > otherMem {
+					otherMem = v
+				}
+
+			case strings.HasPrefix(line, "drm-engine-"):
+				// Matches drm-engine-gfx, drm-engine-compute, drm-engine-dec, drm-engine-enc, etc.
+				fields := strings.Fields(line)
+				if len(fields) >= 2 {
+					if ns, err := strconv.ParseUint(fields[1], 10, 64); err == nil {
+						engineNs += ns
+					}
+				}
 			}
 		}
-		return list[i].nameLower < list[j].nameLower
+
+		if clientID != "" {
+			if _, seen := seenClients[clientID]; seen {
+				continue
+			}
+			seenClients[clientID] = struct{}{}
+		}
+
+		// Prefer dedicated VRAM; on AMD APUs or Intel iGPUs where VRAM is 0/tiny, include GTT/resident
+		clientMem := vram
+		if clientMem == 0 {
+			if gtt > 0 {
+				clientMem = gtt
+			} else {
+				clientMem = otherMem
+			}
+		}
+
+		totalMem += clientMem
+		totalEngineNs += engineNs
+	}
+
+	return totalMem, totalEngineNs
+}
+
+func parseDRMBytes(line string) uint64 {
+	fields := strings.Fields(line)
+	if len(fields) < 2 {
+		return 0
+	}
+	val, err := strconv.ParseUint(fields[1], 10, 64)
+	if err != nil {
+		return 0
+	}
+	if len(fields) >= 3 {
+		switch strings.ToLower(fields[2]) {
+		case "kib", "kb":
+			val *= 1024
+		case "mib", "mb":
+			val *= 1024 * 1024
+		case "gib", "gb":
+			val *= 1024 * 1024 * 1024
+		}
+	}
+	return val
+}
+
+// collectNvidiaGPUByPID uses `nvidia-smi pmon` to capture BOTH Graphics (Vulkan/OpenGL)
+// and Compute (CUDA) processes along with their SM % and VRAM usage.
+func collectNvidiaGPUByPID() map[int32]gpuSample {
+	res := make(map[int32]gpuSample)
+	if !hasNvidiaSMI {
+		return res
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+
+	// pmon -c 1 -s um outputs: gpu pid type sm mem enc dec jpg ofa fb ccpm command
+	out, err := exec.CommandContext(ctx, "nvidia-smi", "pmon", "-c", "1", "-s", "um").Output()
+	if err != nil {
+		return res
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 9 {
+			continue
+		}
+		pid, err := strconv.Atoi(fields[1])
+		if err != nil {
+			continue
+		}
+		smPct, _ := strconv.ParseFloat(fields[3], 64)
+		fbMiB, _ := strconv.ParseUint(fields[8], 10, 64)
+
+		prev := res[int32(pid)]
+		prev.mem += fbMiB * 1024 * 1024
+		if smPct > prev.pct {
+			prev.pct = smPct
+		}
+		res[int32(pid)] = prev
+	}
+	return res
+}
+
+// collectNetBytesByPID returns cumulative rx+tx network bytes per PID.
+func collectNetBytesByPID() map[int32]uint64 {
+	res := make(map[int32]uint64)
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+
+	switch runtime.GOOS {
+	case "linux":
+		if !hasSS {
+			return res
+		}
+		out, err := exec.CommandContext(ctx, "ss", "-tinp").Output()
+		if err != nil {
+			return res
+		}
+		lines := strings.Split(string(out), "\n")
+		var currentPIDs []int32
+		for _, line := range lines {
+			if matches := ssPidRe.FindAllStringSubmatch(line, -1); len(matches) > 0 {
+				currentPIDs = currentPIDs[:0]
+				for _, m := range matches {
+					if p, err := strconv.Atoi(m[1]); err == nil {
+						currentPIDs = append(currentPIDs, int32(p))
+					}
+				}
+				continue
+			}
+			if len(currentPIDs) > 0 {
+				var total uint64
+				if m := ssAckedRe.FindStringSubmatch(line); len(m) == 2 {
+					v, _ := strconv.ParseUint(m[1], 10, 64)
+					total += v
+				}
+				if m := ssRecvRe.FindStringSubmatch(line); len(m) == 2 {
+					v, _ := strconv.ParseUint(m[1], 10, 64)
+					total += v
+				}
+				if total > 0 {
+					for _, pid := range currentPIDs {
+						res[pid] += total
+					}
+				}
+				currentPIDs = currentPIDs[:0]
+			}
+		}
+
+	case "darwin":
+		if !hasNettop {
+			return res
+		}
+		out, err := exec.CommandContext(ctx, "nettop", "-P", "-L", "1", "-x", "-J", "bytes_in,bytes_out").Output()
+		if err != nil {
+			return res
+		}
+		for _, line := range strings.Split(string(out), "\n") {
+			fields := strings.Split(strings.TrimSpace(line), ",")
+			if len(fields) < 3 {
+				continue
+			}
+			procField := fields[0]
+			dotIdx := strings.LastIndexByte(procField, '.')
+			if dotIdx == -1 {
+				continue
+			}
+			pid, err := strconv.Atoi(procField[dotIdx+1:])
+			if err != nil {
+				continue
+			}
+			inBytes, _ := strconv.ParseUint(strings.TrimSpace(fields[1]), 10, 64)
+			outBytes, _ := strconv.ParseUint(strings.TrimSpace(fields[2]), 10, 64)
+			res[int32(pid)] += inBytes + outBytes
+		}
+	}
+	return res
+}
+
+func sortProcs(list []proc, mode sortMode) {
+	sort.SliceStable(list, func(i, j int) bool {
+		a, b := list[i], list[j]
+		switch mode {
+		case sortByCPU:
+			if a.cpu != b.cpu {
+				return a.cpu > b.cpu
+			}
+		case sortByDisk:
+			if a.diskRate != b.diskRate {
+				return a.diskRate > b.diskRate
+			}
+		case sortByNet:
+			if a.netRate != b.netRate {
+				return a.netRate > b.netRate
+			}
+		case sortByGPU:
+			if a.gpuPct != b.gpuPct {
+				return a.gpuPct > b.gpuPct
+			}
+			if a.gpuMem != b.gpuMem {
+				return a.gpuMem > b.gpuMem
+			}
+		default: // sortByMem
+			if a.mem != b.mem {
+				return a.mem > b.mem
+			}
+		}
+		if a.mem != b.mem {
+			return a.mem > b.mem
+		}
+		if a.cpu != b.cpu {
+			return a.cpu > b.cpu
+		}
+		return a.nameLower < b.nameLower
 	})
 }
 
@@ -343,12 +730,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.errMsg = ""
 			return m, nil
 
-		case "tab", "ctrl+s":
-			if m.sortBy == sortByMem {
-				m.sortBy = sortByCPU
-			} else {
-				m.sortBy = sortByMem
-			}
+		case "tab":
+			m.sortBy = (m.sortBy + 1) % sortModeCount
+			sortProcs(m.procs, m.sortBy)
+			m.cursor = 0
+			return m, nil
+
+		case "shift+tab":
+			m.sortBy = (m.sortBy - 1 + sortModeCount) % sortModeCount
 			sortProcs(m.procs, m.sortBy)
 			m.cursor = 0
 			return m, nil
@@ -397,6 +786,33 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+func renderSortBar(active sortMode) string {
+	var b strings.Builder
+	modes := []sortMode{sortByMem, sortByCPU, sortByDisk, sortByNet, sortByGPU}
+	for i, mode := range modes {
+		if i > 0 {
+			b.WriteString(" ")
+		}
+		if mode == active {
+			b.WriteString(activePill.Render(mode.String()))
+		} else {
+			b.WriteString(idlePill.Render(mode.String()))
+		}
+	}
+	b.WriteString(subtle.Render(" ⇥ tab"))
+	return b.String()
+}
+
+func fmtGPU(mem uint64, pct float64) string {
+	if pct >= 0.5 && mem > 0 {
+		return fmt.Sprintf("%4.0f%%/%s", pct, fmtBytes(mem))
+	}
+	if pct >= 0.5 {
+		return fmt.Sprintf("%5.1f%%", pct)
+	}
+	return fmtBytes(mem)
+}
+
 func (m model) View() string {
 	if m.quitting {
 		return ""
@@ -419,17 +835,19 @@ func (m model) View() string {
 	b.WriteString(prompt.Render("  ⚡"))
 	b.WriteString(subtle.Render(" kill pattern "))
 	b.WriteString(m.query.View())
+	b.WriteString("  ")
+	b.WriteString(renderSortBar(m.sortBy))
 	b.WriteString("\n\n")
 
 	list := m.filtered()
 
 	boxW := m.width
-	if boxW < 40 {
-		boxW = 40
+	if boxW < 60 {
+		boxW = 60
 	}
 	contentW := boxW - 4
-	if contentW < 20 {
-		contentW = 20
+	if contentW < 30 {
+		contentW = 30
 	}
 
 	availH := m.height - 3
@@ -468,7 +886,6 @@ func (m model) View() string {
 			up--
 		}
 
-		// Let downward items use whatever vertical space remains
 		downBudget := availH - used - usedUp
 		down := cur + 1
 		usedDown := 0
@@ -481,7 +898,6 @@ func (m model) View() string {
 			down++
 		}
 
-		// If near the bottom of the list, give leftover space back to upward items
 		remaining := availH - used - usedUp - usedDown
 		for up > 0 && remaining > 0 {
 			h := boxHeight(up - 1)
@@ -503,7 +919,17 @@ func (m model) View() string {
 			curs = "❯"
 		}
 
-		header := fmt.Sprintf("%s %d  %s  %5.1f%%  %s", curs, p.pid, fmtMem(p.mem), p.cpu, p.name)
+		header := fmt.Sprintf(
+			"%s %-6d  RAM %6s  CPU %5.1f%%  DSK %8s  NET %8s  GPU %9s  %s",
+			curs,
+			p.pid,
+			fmtBytes(p.mem),
+			p.cpu,
+			fmtRate(p.diskRate),
+			fmtRate(p.netRate),
+			fmtGPU(p.gpuMem, p.gpuPct),
+			p.name,
+		)
 		if w := lipgloss.Width(header); w < contentW {
 			header += strings.Repeat(" ", contentW-w)
 		}
@@ -542,7 +968,7 @@ func (m model) View() string {
 		return b.String()
 	}
 
-	sortHint := fmt.Sprintf("sort: %s (tab)", m.sortBy)
+	sortHint := fmt.Sprintf("sorted by %s (tab / shift+tab)", m.sortBy)
 	switch {
 	case len(list) == 0:
 		b.WriteString(subtle.Render("  nothing found • " + sortHint))
@@ -555,7 +981,7 @@ func (m model) View() string {
 	return b.String()
 }
 
-func fmtMem(b uint64) string {
+func fmtBytes(b uint64) string {
 	switch {
 	case b >= 1024*1024*1024:
 		return fmt.Sprintf("%.1fG", float64(b)/(1024*1024*1024))
@@ -566,6 +992,13 @@ func fmtMem(b uint64) string {
 	default:
 		return fmt.Sprintf("%dB", b)
 	}
+}
+
+func fmtRate(b uint64) string {
+	if b == 0 {
+		return "0B/s"
+	}
+	return fmtBytes(b) + "/s"
 }
 
 func plural(n int) string {
@@ -579,7 +1012,7 @@ func plural(n int) string {
 
 func runCLI(targets []string, force bool) {
 	if len(targets) == 0 {
-		fmt.Fprintln(os.Stderr, "Usage: qkill [-c|--cpu] [-f|--force] [pid|name|:port]...")
+		fmt.Fprintln(os.Stderr, "Usage: qkill [-m|--ram] [-c|--cpu] [-d|--disk] [-n|--net] [-g|--gpu] [-f|--force] [pid|name|:port]...")
 		os.Exit(1)
 	}
 
@@ -711,7 +1144,7 @@ func findPIDsByPortLinux(port string) []int {
 			}
 			if _, ok := targetSockets[link]; ok {
 				pids = append(pids, pid)
-				break // Found match for this PID; move to next process
+				break
 			}
 		}
 	}
@@ -725,8 +1158,16 @@ func main() {
 
 	for _, a := range os.Args[1:] {
 		switch a {
+		case "-m", "--ram", "--mem":
+			initialSort = sortByMem
 		case "-c", "--cpu":
 			initialSort = sortByCPU
+		case "-d", "--disk":
+			initialSort = sortByDisk
+		case "-n", "--net":
+			initialSort = sortByNet
+		case "-g", "--gpu":
+			initialSort = sortByGPU
 		case "-f", "--force":
 			force = true
 		default:
@@ -735,7 +1176,7 @@ func main() {
 	}
 
 	if len(targets) == 0 && !force {
-		// Prime CPU baseline once before the first render so initial CPU % is populated
+		// Prime initial counters (CPU, Disk, Network, AMD/Intel DRM ns)
 		_ = fetchProcs()
 
 		m := model{
@@ -746,7 +1187,7 @@ func main() {
 		m.query.Prompt = ""
 		m.query.Focus()
 		m.query.CharLimit = 64
-		m.query.Width = 32
+		m.query.Width = 24
 		m.query.TextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF"))
 		m.query.PlaceholderStyle = subtle
 
