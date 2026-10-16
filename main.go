@@ -147,6 +147,7 @@ type model struct {
 	sortBy   sortMode
 	quitting bool
 	killPID  int32
+	killName string
 	killDeadline time.Time
 	askForce bool
 	killing  bool
@@ -665,6 +666,18 @@ func (m *model) clampCursor() {
 	}
 }
 
+// restoreCursorToPID moves the cursor to the new index of pid in the
+// (possibly re-sorted) filtered list. Returns false when pid is gone.
+func (m *model) restoreCursorToPID(pid int32) bool {
+	for i, p := range m.filtered() {
+		if p.pid == pid {
+			m.cursor = i
+			return true
+		}
+	}
+	return false
+}
+
 func sliceChunk(s string, limit int) (head, tail string) {
 	if len(s) <= limit {
 		return s, ""
@@ -706,9 +719,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case procsMsg:
 		firstRun := len(m.procs) == 0
+		var selPID int32
+		var hasSel bool
+		if old := m.filtered(); m.cursor >= 0 && m.cursor < len(old) {
+			selPID, hasSel = old[m.cursor].pid, true
+		}
 		m.procs = msg
 		sortProcs(m.procs, m.sortBy)
-		m.clampCursor()
+		if hasSel && !m.restoreCursorToPID(selPID) {
+			m.clampCursor()
+		}
 		if m.killing || m.quitting {
 			return m, nil
 		}
@@ -795,6 +815,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 				m.killPID = p.pid
+				m.killName = p.name
 				m.killing = true
 				m.killDeadline = time.Now().Add(killGracePeriod)
 				return m, tea.Batch(textinput.Blink, checkKillCmd())
@@ -818,10 +839,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	var cmd tea.Cmd
 	prevQuery := m.query.Value()
+	var selPID int32
+	var hasSel bool
+	if old := m.filtered(); m.cursor >= 0 && m.cursor < len(old) {
+		selPID, hasSel = old[m.cursor].pid, true
+	}
 	m.query, cmd = m.query.Update(msg)
 	if m.query.Value() != prevQuery {
 		m.errMsg = ""
-		m.clampCursor()
+		if !(hasSel && m.restoreCursorToPID(selPID)) {
+			m.cursor = 0
+			m.clampCursor()
+		}
 	}
 	return m, cmd
 }
@@ -863,10 +892,10 @@ func (m model) View() string {
 	if m.killing {
 		if m.askForce {
 			b.WriteString(prompt.Render("  ⚡"))
-			b.WriteString(subtle.Render(fmt.Sprintf(" process %d still running — force kill? (y/n) ", m.killPID)))
+			b.WriteString(subtle.Render(fmt.Sprintf(" process %d (%s) still running — force kill? (y/n) ", m.killPID, m.killName)))
 		} else {
 			b.WriteString(prompt.Render("  ⚡"))
-			b.WriteString(subtle.Render(fmt.Sprintf(" sent SIGTERM to %d, waiting... ", m.killPID)))
+			b.WriteString(subtle.Render(fmt.Sprintf(" sent SIGTERM to %d (%s), waiting... ", m.killPID, m.killName)))
 		}
 		b.WriteString("\n")
 		return b.String()
