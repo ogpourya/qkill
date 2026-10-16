@@ -29,6 +29,7 @@ var (
 	footer     = lipgloss.NewStyle().Foreground(lipgloss.Color("#5F5F5F"))
 	activePill = lipgloss.NewStyle().Foreground(lipgloss.Color("#000000")).Background(lipgloss.Color("#5FD7FF")).Bold(true).Padding(0, 1)
 	idlePill   = lipgloss.NewStyle().Foreground(lipgloss.Color("#8A8A8A")).Background(lipgloss.Color("#262626")).Padding(0, 1)
+	deadStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF5F5F")).Bold(true)
 
 	boxStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
@@ -89,6 +90,7 @@ type proc struct {
 	gpuPct       float64 // GPU engine usage (%)
 	cmdline      string
 	cmdlineLower string
+	gone         bool // tombstone: process exited while selected, kept pinned
 }
 
 type gpuSample struct {
@@ -151,6 +153,9 @@ type model struct {
 	killDeadline time.Time
 	askForce bool
 	killing  bool
+	gone     proc // snapshot of selected proc that exited; pinned until user moves
+	hasGone  bool
+	goneIdx  int // pinned position of gone in the filtered list
 	errMsg   string
 }
 
@@ -639,18 +644,34 @@ func sortProcs(list []proc, mode sortMode) {
 }
 
 func (m *model) filtered() []proc {
+	var out []proc
 	raw := m.query.Value()
 	if raw == "" {
-		return m.procs
-	}
-	q := strings.ToLower(raw)
-	out := make([]proc, 0, len(m.procs)/4)
-	for _, p := range m.procs {
-		if strings.Contains(p.nameLower, q) ||
-			strings.Contains(p.pidStr, raw) ||
-			strings.Contains(p.cmdlineLower, q) {
-			out = append(out, p)
+		out = append([]proc(nil), m.procs...)
+	} else {
+		q := strings.ToLower(raw)
+		out = make([]proc, 0, len(m.procs)/4)
+		for _, p := range m.procs {
+			if strings.Contains(p.nameLower, q) ||
+				strings.Contains(p.pidStr, raw) ||
+				strings.Contains(p.cmdlineLower, q) {
+				out = append(out, p)
+			}
 		}
+	}
+	if m.hasGone {
+		g := m.gone
+		g.gone = true
+		idx := m.goneIdx
+		if idx < 0 {
+			idx = 0
+		}
+		if idx > len(out) {
+			idx = len(out)
+		}
+		out = append(out, proc{})
+		copy(out[idx+1:], out[idx:])
+		out[idx] = g
 	}
 	return out
 }
@@ -667,10 +688,10 @@ func (m *model) clampCursor() {
 }
 
 // restoreCursorToPID moves the cursor to the new index of pid in the
-// (possibly re-sorted) filtered list. Returns false when pid is gone.
+// (possibly re-sorted) filtered list. Tombstones never match.
 func (m *model) restoreCursorToPID(pid int32) bool {
 	for i, p := range m.filtered() {
-		if p.pid == pid {
+		if !p.gone && p.pid == pid {
 			m.cursor = i
 			return true
 		}
@@ -719,14 +740,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case procsMsg:
 		firstRun := len(m.procs) == 0
-		var selPID int32
+		var sel proc
 		var hasSel bool
 		if old := m.filtered(); m.cursor >= 0 && m.cursor < len(old) {
-			selPID, hasSel = old[m.cursor].pid, true
+			sel, hasSel = old[m.cursor], true
 		}
 		m.procs = msg
 		sortProcs(m.procs, m.sortBy)
-		if hasSel && !m.restoreCursorToPID(selPID) {
+		switch {
+		case hasSel && !sel.gone && m.restoreCursorToPID(sel.pid):
+			m.hasGone = false
+		case hasSel && !sel.gone:
+			// Selected process exited: pin a tombstone instead of
+			// jumping the cursor onto a live neighbor.
+			sel.gone = true
+			m.gone, m.hasGone, m.goneIdx = sel, true, m.cursor
+			m.clampCursor()
+		case hasSel && sel.gone:
+			// Tombstone selected: the PID may have been reused by a new
+			// live process. Search the clean list first so the index is
+			// exact; re-pin only if still gone.
+			m.hasGone = false
+			if !m.restoreCursorToPID(sel.pid) {
+				m.hasGone = true
+				m.clampCursor()
+			}
+		default:
 			m.clampCursor()
 		}
 		if m.killing || m.quitting {
@@ -785,6 +824,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			}
 			m.query.SetValue("")
+			m.hasGone = false
 			m.cursor = 0
 			m.errMsg = ""
 			return m, nil
@@ -792,12 +832,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "tab":
 			m.sortBy = (m.sortBy + 1) % sortModeCount
 			sortProcs(m.procs, m.sortBy)
+			m.hasGone = false
 			m.cursor = 0
 			return m, nil
 
 		case "shift+tab":
 			m.sortBy = (m.sortBy - 1 + sortModeCount) % sortModeCount
 			sortProcs(m.procs, m.sortBy)
+			m.hasGone = false
 			m.cursor = 0
 			return m, nil
 
@@ -805,6 +847,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			list := m.filtered()
 			if m.cursor >= 0 && m.cursor < len(list) {
 				p := list[m.cursor]
+				if p.gone {
+					m.errMsg = fmt.Sprintf("process %d (%s) already exited", p.pid, p.name)
+					return m, nil
+				}
 				err := syscall.Kill(int(p.pid), syscall.SIGTERM)
 				if errors.Is(err, syscall.ESRCH) {
 					m.quitting = true
@@ -825,6 +871,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "up":
 			if m.cursor > 0 {
 				m.cursor--
+				m.hasGone = false
 			}
 			return m, nil
 
@@ -832,6 +879,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			list := m.filtered()
 			if m.cursor < len(list)-1 {
 				m.cursor++
+				m.hasGone = false
+				m.clampCursor()
 			}
 			return m, nil
 		}
@@ -840,14 +889,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	prevQuery := m.query.Value()
 	var selPID int32
-	var hasSel bool
-	if old := m.filtered(); m.cursor >= 0 && m.cursor < len(old) {
-		selPID, hasSel = old[m.cursor].pid, true
+	var hasLiveSel bool
+	if old := m.filtered(); m.cursor >= 0 && m.cursor < len(old) && !old[m.cursor].gone {
+		selPID, hasLiveSel = old[m.cursor].pid, true
 	}
 	m.query, cmd = m.query.Update(msg)
 	if m.query.Value() != prevQuery {
 		m.errMsg = ""
-		if !(hasSel && m.restoreCursorToPID(selPID)) {
+		m.hasGone = false
+		if !(hasLiveSel && m.restoreCursorToPID(selPID)) {
 			m.cursor = 0
 			m.clampCursor()
 		}
@@ -999,8 +1049,14 @@ func (m model) View() string {
 			fmtGPU(p.gpuMem, p.gpuPct),
 			p.name,
 		)
+		if p.gone {
+			header = fmt.Sprintf("%s ✕ %-6d  %s — exited", curs, p.pid, p.name)
+		}
 		if w := lipgloss.Width(header); w < contentW {
 			header += strings.Repeat(" ", contentW-w)
+		}
+		if p.gone {
+			header = deadStyle.Render(header)
 		}
 
 		var content strings.Builder
@@ -1038,13 +1094,19 @@ func (m model) View() string {
 	}
 
 	sortHint := fmt.Sprintf("sorted by %s (tab / shift+tab)", m.sortBy)
+	live := 0
+	for _, p := range list {
+		if !p.gone {
+			live++
+		}
+	}
 	switch {
 	case len(list) == 0:
 		b.WriteString(subtle.Render("  nothing found • " + sortHint))
 	case end < len(list):
-		b.WriteString(footer.Render(fmt.Sprintf("  %d total — ↓ more • %s", len(list), sortHint)))
+		b.WriteString(footer.Render(fmt.Sprintf("  %d total — ↓ more • %s", live, sortHint)))
 	default:
-		b.WriteString(footer.Render(fmt.Sprintf("  %d process%s • %s", len(list), plural(len(list)), sortHint)))
+		b.WriteString(footer.Render(fmt.Sprintf("  %d process%s • %s", live, plural(live), sortHint)))
 	}
 
 	return b.String()

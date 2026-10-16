@@ -37,6 +37,8 @@ Processes are displayed in bordered boxes. Each header shows PID, RAM, CPU%, dis
 
 A sort bar (`RAM CPU DISK NET GPU`) next to the search prompt shows the active metric. Refresh is every 1s (200ms warmup on startup); CPU/disk/net/GPU rates are per-second deltas between ticks. qkill never lists or kills itself.
 
+Selection follows the same PID across refreshes, so re-sorting never slides the cursor onto a neighbor. If the selected process exits on its own, its entry stays pinned and marked red as exited (ENTER on it does nothing) until you move.
+
 Metric sources:
 
 - RAM: resident memory (RSS)
