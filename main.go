@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -23,16 +24,65 @@ var (
 	subtle = lipgloss.NewStyle().Foreground(lipgloss.Color("#626262"))
 	prompt = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF5F87"))
 	footer = lipgloss.NewStyle().Foreground(lipgloss.Color("#5F5F5F"))
+
+	boxStyle = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("#3A3A3A")).
+			Padding(0, 1)
+
+	selectedBoxStyle = lipgloss.NewStyle().
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(lipgloss.Color("#5FD7FF")).
+				Padding(0, 1)
+
+	selfPID = int32(os.Getpid())
 )
 
 const refreshInterval = 1500 * time.Millisecond
 
-type proc struct {
-	pid     int32
-	name    string
-	mem     uint64
-	cmdline string
+type sortMode int
+
+const (
+	sortByMem sortMode = iota
+	sortByCPU
+)
+
+func (s sortMode) String() string {
+	if s == sortByCPU {
+		return "CPU"
+	}
+	return "RAM"
 }
+
+type proc struct {
+	pid          int32
+	name         string
+	nameLower    string
+	pidStr       string
+	mem          uint64
+	cpu          float64
+	cmdline      string
+	cmdlineLower string
+}
+
+// cachedProc preserves *process.Process across ticks so CPUPercent() computes
+// real-time interval deltas and static strings (name, cmdline) are read once.
+type cachedProc struct {
+	handle       *process.Process
+	createTime   int64
+	name         string
+	nameLower    string
+	pidStr       string
+	cmdline      string
+	cmdlineLower string
+}
+
+var (
+	procCacheMu sync.Mutex
+	procCache   = make(map[int32]*cachedProc)
+)
+
+var sanitizeReplacer = strings.NewReplacer("\n", " ", "\r", " ", "\t", " ")
 
 type model struct {
 	procs    []proc
@@ -40,10 +90,12 @@ type model struct {
 	cursor   int
 	height   int
 	width    int
+	sortBy   sortMode
 	quitting bool
 	killPID  int32
 	askForce bool
 	killing  bool
+	errMsg   string
 }
 
 type tickMsg time.Time
@@ -64,48 +116,134 @@ func forceKillCmd() tea.Cmd {
 type procsMsg []proc
 
 func fetchProcs() tea.Msg {
-	ps, err := process.Processes()
+	pids, err := process.Pids()
 	if err != nil {
 		return procsMsg(nil)
 	}
-	out := make([]proc, 0, len(ps))
-	for _, p := range ps {
-		name, err := p.Name()
-		if err != nil {
+
+	procCacheMu.Lock()
+	defer procCacheMu.Unlock()
+
+	active := make(map[int32]struct{}, len(pids))
+	out := make([]proc, 0, len(pids))
+
+	for _, pid := range pids {
+		if pid == selfPID {
 			continue
 		}
+		active[pid] = struct{}{}
+
+		cp, ok := procCache[pid]
+		if !ok {
+			h, err := process.NewProcess(pid)
+			if err != nil {
+				continue
+			}
+			name, err := h.Name()
+			if err != nil {
+				continue
+			}
+			name = sanitizeReplacer.Replace(name)
+			cmdline, _ := h.Cmdline()
+			cmdline = sanitizeReplacer.Replace(cmdline)
+			ctime, _ := h.CreateTime()
+
+			// Prime baseline CPU times on first sight so the next tick measures delta
+			_, _ = h.CPUPercent()
+
+			cp = &cachedProc{
+				handle:       h,
+				createTime:   ctime,
+				name:         name,
+				nameLower:    strings.ToLower(name),
+				pidStr:       strconv.Itoa(int(pid)),
+				cmdline:      cmdline,
+				cmdlineLower: strings.ToLower(cmdline),
+			}
+			procCache[pid] = cp
+		} else {
+			// Guard against PID reuse
+			if ctime, err := cp.handle.CreateTime(); err != nil || (cp.createTime != 0 && ctime != cp.createTime) {
+				delete(procCache, pid)
+				continue
+			}
+		}
+
 		var mem uint64
-		if mi, err := p.MemoryInfo(); err == nil {
+		if mi, err := cp.handle.MemoryInfo(); err == nil && mi != nil {
 			mem = mi.RSS
 		}
-		cmdline, _ := p.Cmdline()
-		out = append(out, proc{pid: p.Pid, name: name, mem: mem, cmdline: cmdline})
+		cpuPct, _ := cp.handle.CPUPercent()
+
+		out = append(out, proc{
+			pid:          pid,
+			name:         cp.name,
+			nameLower:    cp.nameLower,
+			pidStr:       cp.pidStr,
+			mem:          mem,
+			cpu:          cpuPct,
+			cmdline:      cp.cmdline,
+			cmdlineLower: cp.cmdlineLower,
+		})
 	}
-	sort.SliceStable(out, func(i, j int) bool {
-		if out[i].mem != out[j].mem {
-			return out[i].mem > out[j].mem
+
+	// Evict dead PIDs from cache
+	for pid := range procCache {
+		if _, alive := active[pid]; !alive {
+			delete(procCache, pid)
 		}
-		return strings.ToLower(out[i].name) < strings.ToLower(out[j].name)
-	})
+	}
+
 	return procsMsg(out)
 }
 
-
+func sortProcs(list []proc, mode sortMode) {
+	sort.SliceStable(list, func(i, j int) bool {
+		if mode == sortByCPU {
+			if list[i].cpu != list[j].cpu {
+				return list[i].cpu > list[j].cpu
+			}
+			if list[i].mem != list[j].mem {
+				return list[i].mem > list[j].mem
+			}
+		} else {
+			if list[i].mem != list[j].mem {
+				return list[i].mem > list[j].mem
+			}
+			if list[i].cpu != list[j].cpu {
+				return list[i].cpu > list[j].cpu
+			}
+		}
+		return list[i].nameLower < list[j].nameLower
+	})
+}
 
 func (m *model) filtered() []proc {
-	q := strings.ToLower(m.query.Value())
-	if q == "" {
+	raw := m.query.Value()
+	if raw == "" {
 		return m.procs
 	}
+	q := strings.ToLower(raw)
 	out := make([]proc, 0, len(m.procs)/4)
 	for _, p := range m.procs {
-		if strings.Contains(strings.ToLower(p.name), q) ||
-			strings.Contains(fmt.Sprint(p.pid), m.query.Value()) ||
-			strings.Contains(strings.ToLower(p.cmdline), q) {
+		if strings.Contains(p.nameLower, q) ||
+			strings.Contains(p.pidStr, raw) ||
+			strings.Contains(p.cmdlineLower, q) {
 			out = append(out, p)
 		}
 	}
 	return out
+}
+
+func (m *model) clampCursor() {
+	n := len(m.filtered())
+	if n == 0 {
+		m.cursor = 0
+	} else if m.cursor >= n {
+		m.cursor = n - 1
+	} else if m.cursor < 0 {
+		m.cursor = 0
+	}
 }
 
 func sliceChunk(s string, limit int) (head, tail string) {
@@ -122,6 +260,18 @@ func sliceChunk(s string, limit int) (head, tail string) {
 	return s[:cut], s[cut:]
 }
 
+func countChunks(s string, limit int) int {
+	if s == "" {
+		return 0
+	}
+	lines := 0
+	for s != "" {
+		_, s = sliceChunk(s, limit)
+		lines++
+	}
+	return lines
+}
+
 func (m model) Init() tea.Cmd {
 	return tea.Batch(textinput.Blink, fetchProcs, tickCmd())
 }
@@ -129,13 +279,15 @@ func (m model) Init() tea.Cmd {
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tickMsg:
+		if m.killing || m.quitting {
+			return m, nil
+		}
 		return m, tea.Batch(fetchProcs, tickCmd())
 
 	case procsMsg:
 		m.procs = msg
-		if m.cursor >= len(m.filtered()) {
-			m.cursor = 0
-		}
+		sortProcs(m.procs, m.sortBy)
+		m.clampCursor()
 		return m, nil
 
 	case forceKillTickMsg:
@@ -161,7 +313,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.askForce {
 				switch msg.String() {
 				case "y", "Y", "enter":
-					syscall.Kill(int(m.killPID), syscall.SIGKILL)
+					_ = syscall.Kill(int(m.killPID), syscall.SIGKILL)
 					m.quitting = true
 					return m, tea.Quit
 				case "n", "N", "esc":
@@ -188,6 +340,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.query.SetValue("")
 			m.cursor = 0
+			m.errMsg = ""
+			return m, nil
+
+		case "tab", "ctrl+s":
+			if m.sortBy == sortByMem {
+				m.sortBy = sortByCPU
+			} else {
+				m.sortBy = sortByMem
+			}
+			sortProcs(m.procs, m.sortBy)
+			m.cursor = 0
 			return m, nil
 
 		case "enter":
@@ -195,11 +358,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.cursor >= 0 && m.cursor < len(list) {
 				p := list[m.cursor]
 				err := syscall.Kill(int(p.pid), syscall.SIGTERM)
-				m.killPID = p.pid
 				if errors.Is(err, syscall.ESRCH) {
 					m.quitting = true
 					return m, tea.Quit
 				}
+				if errors.Is(err, syscall.EPERM) {
+					m.errMsg = fmt.Sprintf("permission denied killing PID %d (try sudo)", p.pid)
+					return m, nil
+				}
+				m.killPID = p.pid
 				m.killing = true
 				return m, tea.Batch(textinput.Blink, forceKillCmd())
 			}
@@ -221,7 +388,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	var cmd tea.Cmd
+	prevQuery := m.query.Value()
 	m.query, cmd = m.query.Update(msg)
+	if m.query.Value() != prevQuery {
+		m.errMsg = ""
+		m.clampCursor()
+	}
 	return m, cmd
 }
 
@@ -250,12 +422,6 @@ func (m model) View() string {
 	b.WriteString("\n\n")
 
 	list := m.filtered()
-	if len(list) > 0 && m.cursor >= len(list) {
-		m.cursor = 0
-	}
-	if m.cursor < 0 {
-		m.cursor = 0
-	}
 
 	boxW := m.width
 	if boxW < 40 {
@@ -271,38 +437,62 @@ func (m model) View() string {
 		availH = 3
 	}
 
-	start := 0
-	end := len(list)
+	boxHeight := func(idx int) int {
+		return countChunks(list[idx].cmdline, contentW) + 3
+	}
+
+	start, end := 0, len(list)
 	if end > 0 {
-		// walk up from cursor counting box heights
-		up := m.cursor
+		cur := m.cursor
+		if cur >= end {
+			cur = end - 1
+		}
+		if cur < 0 {
+			cur = 0
+		}
+
+		used := boxHeight(cur)
+		upBudget := (availH - used) / 2
+		if upBudget < 0 {
+			upBudget = 0
+		}
+
+		up := cur
 		usedUp := 0
-		for up >= 0 {
-			boxH := (len(list[up].cmdline)+contentW-1)/contentW + 3
-			if usedUp+boxH > availH/2 && up < m.cursor {
-				up++
+		for up > 0 {
+			h := boxHeight(up - 1)
+			if usedUp+h > upBudget {
 				break
 			}
-			usedUp += boxH
+			usedUp += h
 			up--
 		}
-		if up < 0 {
-			up = 0
-		}
-		start = up
 
-		// walk down from below cursor
-		down := m.cursor + 1
+		// Let downward items use whatever vertical space remains
+		downBudget := availH - used - usedUp
+		down := cur + 1
 		usedDown := 0
 		for down < len(list) {
-			boxH := (len(list[down].cmdline)+contentW-1)/contentW + 3
-			if usedDown+boxH > availH/2 && down > m.cursor {
+			h := boxHeight(down)
+			if usedDown+h > downBudget {
 				break
 			}
-			usedDown += boxH
+			usedDown += h
 			down++
 		}
-		end = down
+
+		// If near the bottom of the list, give leftover space back to upward items
+		remaining := availH - used - usedUp - usedDown
+		for up > 0 && remaining > 0 {
+			h := boxHeight(up - 1)
+			if h > remaining {
+				break
+			}
+			remaining -= h
+			up--
+		}
+
+		start, end = up, down
 	}
 
 	for i := start; i < end; i++ {
@@ -313,7 +503,7 @@ func (m model) View() string {
 			curs = "❯"
 		}
 
-		header := fmt.Sprintf("%s %d  %s  %s", curs, p.pid, fmtMem(p.mem), p.name)
+		header := fmt.Sprintf("%s %d  %s  %5.1f%%  %s", curs, p.pid, fmtMem(p.mem), p.cpu, p.name)
 		if w := lipgloss.Width(header); w < contentW {
 			header += strings.Repeat(" ", contentW-w)
 		}
@@ -338,26 +528,28 @@ func (m model) View() string {
 			}
 		}
 
-		borderColor := "#3A3A3A"
+		style := boxStyle
 		if i == m.cursor {
-			borderColor = "#5FD7FF"
+			style = selectedBoxStyle
 		}
-		style := lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color(borderColor)).
-			Padding(0, 1)
 
 		b.WriteString(style.Render(content.String()))
 		b.WriteString("\n")
 	}
 
+	if m.errMsg != "" {
+		b.WriteString(prompt.Render("  ⚠ " + m.errMsg))
+		return b.String()
+	}
+
+	sortHint := fmt.Sprintf("sort: %s (tab)", m.sortBy)
 	switch {
 	case len(list) == 0:
-		b.WriteString(subtle.Render("  nothing found"))
+		b.WriteString(subtle.Render("  nothing found • " + sortHint))
 	case end < len(list):
-		b.WriteString(footer.Render(fmt.Sprintf("  %d total — ↓ more", len(list))))
+		b.WriteString(footer.Render(fmt.Sprintf("  %d total — ↓ more • %s", len(list), sortHint)))
 	default:
-		b.WriteString(footer.Render(fmt.Sprintf("  %d process%s", len(list), plural(len(list)))))
+		b.WriteString(footer.Render(fmt.Sprintf("  %d process%s • %s", len(list), plural(len(list)), sortHint)))
 	}
 
 	return b.String()
@@ -385,19 +577,9 @@ func plural(n int) string {
 
 // --- CLI ---
 
-func runCLI() {
-	force := false
-	var targets []string
-	for _, a := range os.Args[1:] {
-		switch a {
-		case "-f", "--force":
-			force = true
-		default:
-			targets = append(targets, a)
-		}
-	}
+func runCLI(targets []string, force bool) {
 	if len(targets) == 0 {
-		fmt.Fprintln(os.Stderr, "Usage: qkill [-f] <pid|name|:port>...")
+		fmt.Fprintln(os.Stderr, "Usage: qkill [-c|--cpu] [-f|--force] [pid|name|:port]...")
 		os.Exit(1)
 	}
 
@@ -412,7 +594,9 @@ func runCLI() {
 			killPort(t[1:], sig)
 		case isDigit(t):
 			pid, _ := strconv.Atoi(t)
-			syscall.Kill(pid, sig)
+			if int32(pid) != selfPID {
+				_ = syscall.Kill(pid, sig)
+			}
 		default:
 			killByName(t, sig)
 		}
@@ -435,12 +619,15 @@ func killByName(name string, sig syscall.Signal) {
 	ps, _ := process.Processes()
 	lower := strings.ToLower(name)
 	for _, p := range ps {
+		if p.Pid == selfPID {
+			continue
+		}
 		pname, err := p.Name()
 		if err != nil {
 			continue
 		}
 		if strings.EqualFold(pname, name) || strings.Contains(strings.ToLower(pname), lower) {
-			syscall.Kill(int(p.Pid), sig)
+			_ = syscall.Kill(int(p.Pid), sig)
 		}
 	}
 }
@@ -448,7 +635,9 @@ func killByName(name string, sig syscall.Signal) {
 func killPort(port string, sig syscall.Signal) {
 	if runtime.GOOS == "linux" {
 		for _, pid := range findPIDsByPortLinux(port) {
-			syscall.Kill(pid, sig)
+			if int32(pid) != selfPID {
+				_ = syscall.Kill(pid, sig)
+			}
 		}
 		return
 	}
@@ -457,12 +646,12 @@ func killPort(port string, sig syscall.Signal) {
 	if err != nil {
 		return
 	}
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		pid, err := strconv.Atoi(strings.TrimSpace(line))
-		if err != nil {
+	for _, field := range strings.Fields(string(out)) {
+		pid, err := strconv.Atoi(field)
+		if err != nil || int32(pid) == selfPID {
 			continue
 		}
-		syscall.Kill(pid, sig)
+		_ = syscall.Kill(pid, sig)
 	}
 }
 
@@ -481,7 +670,8 @@ func findPIDsByPortLinux(port string) []int {
 		return nil
 	}
 	hexPort := fmt.Sprintf("%04X", portUint)
-	var inodes []string
+	targetSockets := make(map[string]struct{})
+
 	for _, path := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
 		data, err := os.ReadFile(path)
 		if err != nil {
@@ -489,46 +679,69 @@ func findPIDsByPortLinux(port string) []int {
 		}
 		for _, line := range strings.Split(string(data), "\n")[1:] {
 			fields := strings.Fields(line)
-			if len(fields) < 10 {
+			if len(fields) < 10 || fields[9] == "0" {
 				continue
 			}
 			parts := strings.Split(fields[1], ":")
 			if len(parts) >= 2 && strings.EqualFold(parts[len(parts)-1], hexPort) {
-				inodes = append(inodes, fields[9])
+				targetSockets["socket:["+fields[9]+"]"] = struct{}{}
 			}
 		}
 	}
-	if len(inodes) == 0 {
+	if len(targetSockets) == 0 {
 		return nil
 	}
+
+	var pids []int
 	entries, _ := os.ReadDir("/proc")
 	for _, entry := range entries {
 		pid, err := strconv.Atoi(entry.Name())
 		if err != nil {
 			continue
 		}
-		fds, err := os.ReadDir("/proc/" + entry.Name() + "/fd")
+		fdDir := "/proc/" + entry.Name() + "/fd"
+		fds, err := os.ReadDir(fdDir)
 		if err != nil {
 			continue
 		}
 		for _, fd := range fds {
-			link, err := os.Readlink("/proc/" + entry.Name() + "/fd/" + fd.Name())
+			link, err := os.Readlink(fdDir + "/" + fd.Name())
 			if err != nil {
 				continue
 			}
-			for _, ino := range inodes {
-				if link == "socket:["+ino+"]" {
-					return []int{pid}
-				}
+			if _, ok := targetSockets[link]; ok {
+				pids = append(pids, pid)
+				break // Found match for this PID; move to next process
 			}
 		}
 	}
-	return nil
+	return pids
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		m := model{query: textinput.New()}
+	initialSort := sortByMem
+	force := false
+	var targets []string
+
+	for _, a := range os.Args[1:] {
+		switch a {
+		case "-c", "--cpu":
+			initialSort = sortByCPU
+		case "-f", "--force":
+			force = true
+		default:
+			targets = append(targets, a)
+		}
+	}
+
+	if len(targets) == 0 && !force {
+		// Prime CPU baseline once before the first render so initial CPU % is populated
+		_ = fetchProcs()
+
+		m := model{
+			query:  textinput.New(),
+			sortBy: initialSort,
+		}
 		m.query.Placeholder = "..."
 		m.query.Prompt = ""
 		m.query.Focus()
@@ -543,5 +756,6 @@ func main() {
 		}
 		return
 	}
-	runCLI()
+
+	runCLI(targets, force)
 }
