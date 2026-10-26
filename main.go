@@ -1152,18 +1152,38 @@ func runCLI(targets []string, force bool) {
 		sig = syscall.SIGKILL
 	}
 
+	hadError := false
 	for _, t := range targets {
+		var count int
+		var err error
 		switch {
 		case strings.HasPrefix(t, ":"):
-			killPort(t[1:], sig)
+			count, err = killPort(t[1:], sig)
 		case isDigit(t):
 			pid, _ := strconv.Atoi(t)
-			if int32(pid) != selfPID {
-				_ = syscall.Kill(pid, sig)
+			if int32(pid) == selfPID {
+				count = 0
+			} else {
+				err = syscall.Kill(pid, sig)
+				if err == nil {
+					count = 1
+				}
 			}
 		default:
-			killByName(t, sig)
+			count, err = killByName(t, sig)
 		}
+
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "qkill: %s: %v\n", t, err)
+			hadError = true
+		} else if count == 0 {
+			fmt.Fprintf(os.Stderr, "qkill: %s: no process found\n", t)
+			hadError = true
+		}
+	}
+
+	if hadError {
+		os.Exit(1)
 	}
 }
 
@@ -1179,9 +1199,14 @@ func isDigit(s string) bool {
 	return true
 }
 
-func killByName(name string, sig syscall.Signal) {
-	ps, _ := process.Processes()
+func killByName(name string, sig syscall.Signal) (int, error) {
+	ps, err := process.Processes()
+	if err != nil {
+		return 0, err
+	}
 	lower := strings.ToLower(name)
+	killed := 0
+	var lastErr error
 	for _, p := range ps {
 		if p.Pid == selfPID {
 			continue
@@ -1191,32 +1216,58 @@ func killByName(name string, sig syscall.Signal) {
 			continue
 		}
 		if strings.EqualFold(pname, name) || strings.Contains(strings.ToLower(pname), lower) {
-			_ = syscall.Kill(int(p.Pid), sig)
-		}
-	}
-}
-
-func killPort(port string, sig syscall.Signal) {
-	if runtime.GOOS == "linux" {
-		for _, pid := range findPIDsByPortLinux(port) {
-			if int32(pid) != selfPID {
-				_ = syscall.Kill(pid, sig)
+			if err := syscall.Kill(int(p.Pid), sig); err != nil {
+				lastErr = err
+			} else {
+				killed++
 			}
 		}
-		return
+	}
+	if killed == 0 && lastErr != nil {
+		return 0, lastErr
+	}
+	return killed, nil
+}
+
+func killPort(port string, sig syscall.Signal) (int, error) {
+	killed := 0
+	var lastErr error
+	if runtime.GOOS == "linux" {
+		for _, pid := range findPIDsByPortLinux(port) {
+			if int32(pid) == selfPID {
+				continue
+			}
+			if err := syscall.Kill(pid, sig); err != nil {
+				lastErr = err
+			} else {
+				killed++
+			}
+		}
+		if killed == 0 && lastErr != nil {
+			return 0, lastErr
+		}
+		return killed, nil
 	}
 	cmd, args := portCmd(port)
 	out, err := exec.Command(cmd, args...).Output()
 	if err != nil {
-		return
+		return 0, nil
 	}
 	for _, field := range strings.Fields(string(out)) {
 		pid, err := strconv.Atoi(field)
 		if err != nil || int32(pid) == selfPID {
 			continue
 		}
-		_ = syscall.Kill(pid, sig)
+		if err := syscall.Kill(pid, sig); err != nil {
+			lastErr = err
+		} else {
+			killed++
+		}
 	}
+	if killed == 0 && lastErr != nil {
+		return 0, lastErr
+	}
+	return killed, nil
 }
 
 func portCmd(port string) (string, []string) {
