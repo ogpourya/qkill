@@ -18,8 +18,8 @@ qkill -d  # sort by disk I/O rate
 qkill -n  # sort by network rate
 qkill -g  # sort by GPU usage
 
-# kill by pid
-qkill 1337
+# kill by pid (% prefix)
+qkill %1337
 
 # kill by name (case-insensitive substring match, not exact name)
 qkill chrome
@@ -28,12 +28,14 @@ qkill chrome
 qkill :8080
 
 # force kill (SIGKILL)
-qkill -f 1337 chrome :3000
+qkill -f %1337 chrome :3000
 ```
+
+Targets are disambiguated by prefix: `%1337` is PID 1337, `:8080` is port 8080, and anything else is a process name. `%` and `:` are used because `#` reads as a shell comment and `@` is ambiguous.
 
 Name matching is a case-insensitive substring match, not an exact name match: `qkill chrome` matches `chrome`, `chrome_crashpad`, `google-chrome`, and any other process whose name contains `chrome`. Check the matches with `pgrep -l` before killing if that matters.
 
-An all-digit argument is treated as a PID first. Only if no such PID exists does qkill fall back to matching it as a process name, so a process literally named `1337` can be killed with `qkill 1337` unless PID 1337 is taken.
+A bare number is a name too, so a process literally named `1337` is killed with `qkill 1337`, while `qkill %1337` kills the process whose PID is 1337.
 
 ## Interactive TUI
 

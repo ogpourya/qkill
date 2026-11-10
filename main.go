@@ -1135,7 +1135,7 @@ func plural(n int) string {
 
 func runCLI(targets []string, force bool) {
 	if len(targets) == 0 {
-		fmt.Fprintln(os.Stderr, "Usage: qkill [-m|--ram] [-c|--cpu] [-d|--disk] [-n|--net] [-g|--gpu] [-f|--force] [pid|name|:port]...")
+		fmt.Fprintf(os.Stderr, "Usage: qkill [-m|--ram] [-c|--cpu] [-d|--disk] [-n|--net] [-g|--gpu] [-f|--force] [%%pid|name|:port]...\n")
 		os.Exit(1)
 	}
 
@@ -1151,17 +1151,16 @@ func runCLI(targets []string, force bool) {
 		switch {
 		case strings.HasPrefix(t, ":"):
 			count, err = killPort(t[1:], sig)
-		case isDigit(t):
-			pid, _ := strconv.Atoi(t)
-			if int32(pid) == selfPID {
+		case strings.HasPrefix(t, "%"):
+			pid, perr := strconv.Atoi(t[1:])
+			if perr != nil || pid <= 0 {
+				err = fmt.Errorf("invalid pid")
+			} else if int32(pid) == selfPID {
 				count = 0
 			} else {
 				err = syscall.Kill(pid, sig)
 				if err == nil {
 					count = 1
-				} else if errors.Is(err, syscall.ESRCH) {
-					// No such PID: allow numeric process names (e.g. "1337").
-					count, err = killByName(t, sig)
 				}
 			}
 		default:
@@ -1180,18 +1179,6 @@ func runCLI(targets []string, force bool) {
 	if hadError {
 		os.Exit(1)
 	}
-}
-
-func isDigit(s string) bool {
-	if len(s) == 0 {
-		return false
-	}
-	for _, c := range s {
-		if c < '0' || c > '9' {
-			return false
-		}
-	}
-	return true
 }
 
 func killByName(name string, sig syscall.Signal) (int, error) {
