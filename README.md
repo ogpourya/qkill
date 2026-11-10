@@ -21,7 +21,7 @@ qkill -g  # sort by GPU usage
 # kill by pid
 qkill 1337
 
-# kill by name
+# kill by name (case-insensitive substring match, not exact name)
 qkill chrome
 
 # kill by port
@@ -30,6 +30,8 @@ qkill :8080
 # force kill (SIGKILL)
 qkill -f 1337 chrome :3000
 ```
+
+Name matching is a case-insensitive substring match, not an exact name match: `qkill chrome` matches `chrome`, `chrome_crashpad`, `google-chrome`, and any other process whose name contains `chrome`. Check the matches with `pgrep -l` before killing if that matters.
 
 ## Interactive TUI
 
