@@ -33,6 +33,8 @@ qkill -f 1337 chrome :3000
 
 Name matching is a case-insensitive substring match, not an exact name match: `qkill chrome` matches `chrome`, `chrome_crashpad`, `google-chrome`, and any other process whose name contains `chrome`. Check the matches with `pgrep -l` before killing if that matters.
 
+An all-digit argument is treated as a PID first. Only if no such PID exists does qkill fall back to matching it as a process name, so a process literally named `1337` can be killed with `qkill 1337` unless PID 1337 is taken.
+
 ## Interactive TUI
 
 Processes are displayed in bordered boxes. Each header shows PID, RAM, CPU%, disk I/O rate, network rate, GPU usage, and process name, followed by the wrapped command line.

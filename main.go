@@ -1159,6 +1159,9 @@ func runCLI(targets []string, force bool) {
 				err = syscall.Kill(pid, sig)
 				if err == nil {
 					count = 1
+				} else if errors.Is(err, syscall.ESRCH) {
+					// No such PID: allow numeric process names (e.g. "1337").
+					count, err = killByName(t, sig)
 				}
 			}
 		default:
