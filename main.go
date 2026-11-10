@@ -260,11 +260,6 @@ func fetchProcs() tea.Msg {
 			if ioStat, err := h.IOCounters(); err == nil && ioStat != nil {
 				initDisk = ioStat.ReadBytes + ioStat.WriteBytes
 			}
-			var initGPUNs uint64
-			if runtime.GOOS == "linux" {
-				_, initGPUNs = readLinuxDRMStats(pid)
-			}
-
 			cp = &cachedProc{
 				handle:       h,
 				createTime:   ctime,
@@ -275,9 +270,7 @@ func fetchProcs() tea.Msg {
 				cmdlineLower: strings.ToLower(cmdline),
 				lastDisk:     initDisk,
 				lastNet:      netTotals[pid],
-				lastGPUNs:    initGPUNs,
 				hasNetSample: netTotals[pid] > 0,
-				hasGPUSample: initGPUNs > 0,
 				lastSample:   now,
 			}
 			procCache[pid] = cp
@@ -571,7 +564,6 @@ func collectNetBytesByPID() map[int32]uint64 {
 						res[pid] += total
 					}
 				}
-				currentPIDs = currentPIDs[:0]
 			}
 		}
 
@@ -1287,7 +1279,7 @@ func findPIDsByPortLinux(port string) []int {
 	hexPort := fmt.Sprintf("%04X", portUint)
 	targetSockets := make(map[string]struct{})
 
-	for _, path := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
+	for _, path := range []string{"/proc/net/tcp", "/proc/net/tcp6", "/proc/net/udp", "/proc/net/udp6"} {
 		data, err := os.ReadFile(path)
 		if err != nil {
 			continue
