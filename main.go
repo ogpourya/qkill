@@ -181,8 +181,13 @@ func checkKillCmd() tea.Cmd {
 // isAliveAndNotZombie reports whether pid is still a live process.
 // A zombie (dead but unreaped) counts as dead so we quit instead of prompting.
 func isAliveAndNotZombie(pid int32) bool {
-	if errors.Is(syscall.Kill(int(pid), 0), syscall.ESRCH) {
+	err := syscall.Kill(int(pid), 0)
+	if errors.Is(err, syscall.ESRCH) {
 		return false
+	}
+	if err != nil {
+		// EPERM: the process exists but we may not signal it.
+		return true
 	}
 	if p, err := process.NewProcess(pid); err == nil {
 		if statuses, err := p.Status(); err == nil {
@@ -191,11 +196,7 @@ func isAliveAndNotZombie(pid int32) bool {
 					return false
 				}
 			}
-		} else {
-			return false
 		}
-	} else {
-		return false
 	}
 	return true
 }
@@ -240,8 +241,10 @@ func fetchProcs() tea.Msg {
 		}
 		active[pid] = struct{}{}
 
+		fresh := false
 		cp, ok := procCache[pid]
 		if !ok {
+			fresh = true
 			h, err := process.NewProcess(pid)
 			if err != nil {
 				continue
@@ -293,7 +296,10 @@ func fetchProcs() tea.Msg {
 		}
 
 		// 2. CPU
-		cpuPct, _ := cp.handle.CPUPercent()
+		var cpuPct float64
+		if !fresh {
+			cpuPct, _ = cp.handle.CPUPercent()
+		}
 
 		// 3. Disk I/O rate (bytes/sec)
 		var diskRate uint64
@@ -373,9 +379,27 @@ func fetchProcs() tea.Msg {
 	return procsMsg(out)
 }
 
+// linuxHasDRM reports whether this host exposes GPU device nodes at all.
+// Most servers do not, which makes every per-process DRM scan unnecessary.
+var (
+	drmCheckOnce sync.Once
+	drmPresent   bool
+)
+
+func linuxHasDRM() bool {
+	drmCheckOnce.Do(func() {
+		_, err := os.Stat("/dev/dri")
+		drmPresent = err == nil
+	})
+	return drmPresent
+}
+
 // readLinuxDRMStats reads AMD (amdgpu) and Intel (i915/xe) GPU usage directly
 // from the Linux kernel DRM subsystem via /proc/<pid>/fd and /proc/<pid>/fdinfo.
 func readLinuxDRMStats(pid int32) (totalMem uint64, totalEngineNs uint64) {
+	if pid <= 2 || !linuxHasDRM() {
+		return 0, 0
+	}
 	pidStr := strconv.Itoa(int(pid))
 	fdDir := "/proc/" + pidStr + "/fd"
 	fdinfoDir := "/proc/" + pidStr + "/fdinfo"
@@ -547,6 +571,12 @@ func collectNetBytesByPID() map[int32]uint64 {
 						currentPIDs = append(currentPIDs, int32(p))
 					}
 				}
+				continue
+			}
+			// Socket lines start in column 0; metric lines are indented.
+			// A new socket with no PID data must not inherit the previous PID.
+			if line == "" || (line[0] != ' ' && line[0] != '\t') {
+				currentPIDs = currentPIDs[:0]
 				continue
 			}
 			if len(currentPIDs) > 0 {
@@ -772,7 +802,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if time.Now().After(m.killDeadline) {
 			m.askForce = true
-			return m, nil
 		}
 		return m, checkKillCmd()
 
@@ -1186,7 +1215,6 @@ func killByName(name string, sig syscall.Signal) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	lower := strings.ToLower(name)
 	killed := 0
 	var lastErr error
 	for _, p := range ps {
@@ -1197,7 +1225,7 @@ func killByName(name string, sig syscall.Signal) (int, error) {
 		if err != nil {
 			continue
 		}
-		if strings.EqualFold(pname, name) || strings.Contains(strings.ToLower(pname), lower) {
+		if strings.EqualFold(pname, name) {
 			if err := syscall.Kill(int(p.Pid), sig); err != nil {
 				lastErr = err
 			} else {
@@ -1320,7 +1348,12 @@ func main() {
 	force := false
 	var targets []string
 
+	stopFlags := false
 	for _, a := range os.Args[1:] {
+		if stopFlags {
+			targets = append(targets, a)
+			continue
+		}
 		switch a {
 		case "-m", "--ram", "--mem":
 			initialSort = sortByMem
@@ -1334,7 +1367,13 @@ func main() {
 			initialSort = sortByGPU
 		case "-f", "--force":
 			force = true
+		case "--":
+			stopFlags = true
 		default:
+			if strings.HasPrefix(a, "-") && a != "-" {
+				fmt.Fprintf(os.Stderr, "qkill: unknown flag %s (use -- before a name starting with -)\n", a)
+				os.Exit(1)
+			}
 			targets = append(targets, a)
 		}
 	}
